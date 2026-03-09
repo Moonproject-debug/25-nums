@@ -565,7 +565,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers - UPDATED to update priceCounts
+// Delete numbers - UPDATED to properly update priceCounts
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -603,8 +603,8 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       const batch = db.batch();
       const priceUpdates = {}; // Track price counts to update
       
+      // First, get all numbers to check their status and price
       for (const id of numberIds) {
-        // Get the number document first to know its price and status
         const numberDoc = await db.collection('numbers').doc(id).get();
         
         if (numberDoc.exists) {
@@ -616,7 +616,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
             priceUpdates[price] = (priceUpdates[price] || 0) + 1;
           }
           
-          // Delete the number document
+          // Add delete operation to batch
           batch.delete(numberDoc.ref);
         }
       }
@@ -629,6 +629,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         }, { merge: true });
       }
       
+      // Commit all changes
       await batch.commit();
       
       res.json({
