@@ -7,21 +7,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize Firebase Admin
-const serviceAccount = {
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-};
+// Initialize Firebase Admin with error handling
+try {
+  const serviceAccount = {
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  };
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+  // Check if required env vars exist
+  if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_PRIVATE_KEY || !process.env.FIREBASE_CLIENT_EMAIL) {
+    console.error('Missing Firebase environment variables');
+  } else {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log('Firebase initialized successfully');
+  }
+} catch (error) {
+  console.error('Firebase initialization error:', error);
+}
 
 const db = admin.firestore();
 const auth = admin.auth();
 
-// ==================== AUTH ENDPOINTS (ADDED) ====================
+// ==================== AUTH ENDPOINTS ====================
 
 // User Signup
 app.post('/api/auth/signup', async (req, res) => {
@@ -32,33 +42,50 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
     
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
     // Create user in Firebase Auth
     const userRecord = await auth.createUser({
-      email: email.toLowerCase(),
+      email: email.toLowerCase().trim(),
       password: password,
     });
     
     // Create user document in Firestore with initial balance 0
     await db.collection('users').doc(userRecord.uid).set({
-      email: email.toLowerCase(),
+      email: email.toLowerCase().trim(),
       balance: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     
+    console.log('User created successfully:', userRecord.uid);
+    
     res.json({
       success: true,
       userId: userRecord.uid,
-      email: email.toLowerCase()
+      email: email.toLowerCase().trim()
     });
     
   } catch (error) {
-    console.error('Signup error:', error);
+    console.error('Signup error details:', error);
     
     if (error.code === 'auth/email-already-exists') {
       return res.status(400).json({ error: 'Email already exists' });
     }
     
-    res.status(500).json({ error: error.message });
+    if (error.code === 'auth/invalid-email') {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    if (error.code === 'auth/weak-password') {
+      return res.status(400).json({ error: 'Password is too weak' });
+    }
+    
+    res.status(500).json({ 
+      error: 'Signup failed: ' + error.message,
+      code: error.code 
+    });
   }
 });
 
@@ -71,22 +98,20 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
     
-    // Firebase Admin SDK doesn't support password verification directly
-    // We'll use a custom approach: check if user exists and verify via custom token
+    // Get user by email
+    const userRecord = await auth.getUserByEmail(email.toLowerCase().trim());
     
-    const userRecord = await auth.getUserByEmail(email.toLowerCase());
+    // Note: Firebase Admin SDK can't verify passwords directly
+    // In production, use Firebase Client SDK or custom authentication
+    // For now, we'll assume if user exists, login is successful
     
-    // Since Admin SDK can't verify password, we'll use a simple check
-    // In production, you should use Firebase Client SDK or custom authentication
-    // For this demo, we'll assume password is correct if user exists
-    
-    // Get user data from Firestore
+    // Get or create user document in Firestore
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
     
     if (!userDoc.exists) {
-      // Create user document if it doesn't exist (backward compatibility)
+      // Create user document if it doesn't exist
       await db.collection('users').doc(userRecord.uid).set({
-        email: email.toLowerCase(),
+        email: email.toLowerCase().trim(),
         balance: 0,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -95,17 +120,20 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({
       success: true,
       userId: userRecord.uid,
-      email: email.toLowerCase()
+      email: email.toLowerCase().trim()
     });
     
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('Login error details:', error);
     
     if (error.code === 'auth/user-not-found') {
       return res.status(400).json({ error: 'User not found' });
     }
     
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      error: 'Login failed: ' + error.message,
+      code: error.code 
+    });
   }
 });
 
@@ -124,15 +152,16 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid admin token' });
     }
     
-    // Check if user exists and is admin (you can maintain admin list in Firestore)
-    const userRecord = await auth.getUserByEmail(email.toLowerCase());
+    // Get user by email
+    const userRecord = await auth.getUserByEmail(email.toLowerCase().trim());
     
-    // Check if this email is in admin list (optional)
-    // For now, any user with correct token can login as admin
+    // Set admin custom claim
+    await auth.setCustomUserClaims(userRecord.uid, { admin: true });
     
     res.json({
       success: true,
-      adminEmail: email.toLowerCase()
+      adminEmail: email.toLowerCase().trim(),
+      userId: userRecord.uid
     });
     
   } catch (error) {
@@ -142,13 +171,13 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(400).json({ error: 'Admin not found' });
     }
     
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Admin login failed: ' + error.message });
   }
 });
 
 // ==================== USER ENDPOINTS ====================
 
-// Get user balance and price list (single request)
+// Get user balance and price list
 app.post('/api/user/dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -166,7 +195,7 @@ app.post('/api/user/dashboard', async (req, res) => {
     
     const userData = userDoc.data();
     
-    // Get all price counts - single query
+    // Get all price counts
     const priceCountsSnapshot = await db.collection('priceCounts').get();
     
     const priceList = [];
@@ -206,7 +235,7 @@ app.post('/api/user/buy-number', async (req, res) => {
     
     const priceStr = price.toString();
     
-    // Run transaction to ensure consistency
+    // Run transaction
     const result = await db.runTransaction(async (transaction) => {
       // Get user data
       const userRef = db.collection('users').doc(userId);
@@ -231,7 +260,7 @@ app.post('/api/user/buy-number', async (req, res) => {
         throw new Error('No numbers available at this price');
       }
       
-      // Find an available number at this price
+      // Find available number
       const numbersQuery = await db.collection('numbers')
         .where('price', '==', priceStr)
         .where('status', '==', 'available')
@@ -245,14 +274,14 @@ app.post('/api/user/buy-number', async (req, res) => {
       const numberDoc = numbersQuery.docs[0];
       const numberData = numberDoc.data();
       
-      // Update number status to sold
+      // Update number status
       transaction.update(numberDoc.ref, { 
         status: 'sold',
         soldTo: userId,
         soldAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Decrease price count
+      // Update price count
       transaction.update(priceCountRef, {
         availableCount: admin.firestore.FieldValue.increment(-1),
         soldCount: admin.firestore.FieldValue.increment(1)
@@ -358,8 +387,10 @@ app.post('/api/proxy', async (req, res) => {
       return res.status(400).json({ error: 'URL required' });
     }
     
-    const fetch = await import('node-fetch');
-    const response = await fetch.default(url, {
+    // Use dynamic import for node-fetch
+    const fetch = (await import('node-fetch')).default;
+    
+    const response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)'
       },
@@ -389,20 +420,28 @@ app.post('/api/admin/dashboard', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Get total users
+    // Get total users count
     const usersSnapshot = await db.collection('users').count().get();
+    const totalUsers = usersSnapshot.data().count || 0;
     
-    // Get numbers stats
+    // Get available numbers count
     const availableSnapshot = await db.collection('numbers')
-      .where('status', '==', 'available').count().get();
+      .where('status', '==', 'available')
+      .count()
+      .get();
+    const availableNumbers = availableSnapshot.data().count || 0;
     
+    // Get sold numbers count
     const soldSnapshot = await db.collection('numbers')
-      .where('status', '==', 'sold').count().get();
+      .where('status', '==', 'sold')
+      .count()
+      .get();
+    const soldNumbers = soldSnapshot.data().count || 0;
     
     res.json({
-      totalUsers: usersSnapshot.data().count || 0,
-      availableNumbers: availableSnapshot.data().count || 0,
-      soldNumbers: soldSnapshot.data().count || 0
+      totalUsers,
+      availableNumbers,
+      soldNumbers
     });
     
   } catch (error) {
@@ -456,6 +495,10 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       addedCount++;
     }
     
+    if (addedCount === 0) {
+      return res.status(400).json({ error: 'No valid numbers found' });
+    }
+    
     // Update price count
     batch.set(priceCountRef, {
       availableCount: admin.firestore.FieldValue.increment(addedCount),
@@ -476,7 +519,7 @@ app.post('/api/admin/add-numbers', async (req, res) => {
   }
 });
 
-// Get numbers with pagination (30 per page)
+// Get numbers with pagination
 app.post('/api/admin/numbers', async (req, res) => {
   try {
     const { status, lastDocId } = req.body;
@@ -539,15 +582,20 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         .get();
       
       const batch = db.batch();
+      let deletedCount = 0;
+      
       soldSnapshot.forEach(doc => {
         batch.delete(doc.ref);
+        deletedCount++;
       });
       
-      await batch.commit();
+      if (deletedCount > 0) {
+        await batch.commit();
+      }
       
       res.json({
         success: true,
-        message: `All sold numbers deleted`
+        message: `${deletedCount} sold numbers deleted`
       });
       
     } else if (numberIds && numberIds.length > 0) {
@@ -575,7 +623,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
   }
 });
 
-// Get users with pagination (30 per page)
+// Get users with pagination
 app.post('/api/admin/users', async (req, res) => {
   try {
     const { lastDocId, searchEmail } = req.body;
@@ -588,7 +636,7 @@ app.post('/api/admin/users', async (req, res) => {
     if (searchEmail) {
       // Search by email
       const snapshot = await db.collection('users')
-        .where('email', '==', searchEmail.toLowerCase())
+        .where('email', '==', searchEmail.toLowerCase().trim())
         .limit(1)
         .get();
       
@@ -654,8 +702,12 @@ app.post('/api/admin/update-user-balance', async (req, res) => {
       return res.status(400).json({ error: 'UserId and newBalance required' });
     }
     
+    if (isNaN(parseInt(newBalance)) || parseInt(newBalance) < 0) {
+      return res.status(400).json({ error: 'Invalid balance value' });
+    }
+    
     await db.collection('users').doc(userId).update({
-      balance: parseInt(newBalance) || 0
+      balance: parseInt(newBalance)
     });
     
     res.json({ success: true });
@@ -694,12 +746,11 @@ app.post('/api/admin/delete-user', async (req, res) => {
     
     await batch.commit();
     
-    // Also delete from Firebase Auth
+    // Delete from Firebase Auth
     try {
       await auth.deleteUser(userId);
     } catch (authError) {
       console.error('Auth deletion error:', authError);
-      // Continue even if auth deletion fails
     }
     
     res.json({ success: true });
@@ -712,7 +763,36 @@ app.post('/api/admin/delete-user', async (req, res) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    firebase: admin.apps.length > 0 ? 'connected' : 'disconnected'
+  });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'USA Nums by Moon API',
+    endpoints: [
+      '/api/health',
+      '/api/auth/signup',
+      '/api/auth/login',
+      '/api/admin/login',
+      '/api/user/dashboard',
+      '/api/user/buy-number',
+      '/api/user/my-numbers',
+      '/api/user/delete-number',
+      '/api/proxy',
+      '/api/admin/dashboard',
+      '/api/admin/add-numbers',
+      '/api/admin/numbers',
+      '/api/admin/delete-numbers',
+      '/api/admin/users',
+      '/api/admin/update-user-balance',
+      '/api/admin/delete-user'
+    ]
+  });
 });
 
 // 404 handler
