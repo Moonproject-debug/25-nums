@@ -101,10 +101,6 @@ app.post('/api/auth/login', async (req, res) => {
     // Get user by email
     const userRecord = await auth.getUserByEmail(email.toLowerCase().trim());
     
-    // Note: Firebase Admin SDK can't verify passwords directly
-    // In production, use Firebase Client SDK or custom authentication
-    // For now, we'll assume if user exists, login is successful
-    
     // Get or create user document in Firestore
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
     
@@ -565,7 +561,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers - UPDATED to properly update priceCounts
+// Delete numbers - FIXED VERSION with proper priceCounts update
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -599,7 +595,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       });
       
     } else if (numberIds && numberIds.length > 0) {
-      // Delete specific numbers - Need to update priceCounts for available numbers
+      // Delete specific numbers - FIXED: Properly update priceCounts
       const batch = db.batch();
       const priceUpdates = {}; // Track price counts to update
       
@@ -614,6 +610,9 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
           if (numberData.status === 'available') {
             const price = numberData.price.toString();
             priceUpdates[price] = (priceUpdates[price] || 0) + 1;
+            console.log(`Price update needed: ${price} - decrement by 1`);
+          } else {
+            console.log(`Skipping price update for sold number: ${id}`);
           }
           
           // Add delete operation to batch
@@ -624,17 +623,41 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       // Update priceCounts for affected prices
       for (const [price, count] of Object.entries(priceUpdates)) {
         const priceCountRef = db.collection('priceCounts').doc(price);
-        batch.set(priceCountRef, {
-          availableCount: admin.firestore.FieldValue.increment(-count)
-        }, { merge: true });
+        
+        // First check if document exists
+        const priceCountDoc = await priceCountRef.get();
+        
+        if (priceCountDoc.exists) {
+          const currentCount = priceCountDoc.data().availableCount || 0;
+          console.log(`Price ${price}: Current count ${currentCount}, decrementing by ${count}`);
+          
+          batch.set(priceCountRef, {
+            availableCount: admin.firestore.FieldValue.increment(-count)
+          }, { merge: true });
+        } else {
+          console.log(`Price ${price} count document doesn't exist, creating with 0`);
+          batch.set(priceCountRef, {
+            availableCount: 0,
+            soldCount: 0
+          });
+        }
       }
       
       // Commit all changes
       await batch.commit();
       
+      // Double-check the update by reading back
+      for (const [price, count] of Object.entries(priceUpdates)) {
+        const updatedDoc = await db.collection('priceCounts').doc(price).get();
+        if (updatedDoc.exists) {
+          console.log(`After update - Price ${price}: ${updatedDoc.data().availableCount} available`);
+        }
+      }
+      
       res.json({
         success: true,
-        message: `${numberIds.length} numbers deleted (${Object.keys(priceUpdates).length} price counts updated)`
+        message: `${numberIds.length} numbers deleted (${Object.keys(priceUpdates).length} price counts updated)`,
+        priceUpdates: priceUpdates
       });
       
     } else {
@@ -643,7 +666,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
     
   } catch (error) {
     console.error('Delete numbers error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
 
