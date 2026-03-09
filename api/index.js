@@ -561,7 +561,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers - FIXED VERSION with proper priceCounts update
+// Delete numbers - COMPLETELY FIXED VERSION
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -589,79 +589,103 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         await batch.commit();
       }
       
-      res.json({
+      return res.json({
         success: true,
         message: `${deletedCount} sold numbers deleted`
       });
       
     } else if (numberIds && numberIds.length > 0) {
-      // Delete specific numbers - FIXED: Properly update priceCounts
-      const batch = db.batch();
-      const priceUpdates = {}; // Track price counts to update
+      // Delete specific numbers - FIXED: Process in smaller batches to avoid transaction limits
+      const BATCH_SIZE = 10; // Process 10 numbers at a time
+      const results = {
+        totalDeleted: 0,
+        priceUpdates: {}
+      };
       
-      // First, get all numbers to check their status and price
-      for (const id of numberIds) {
-        const numberDoc = await db.collection('numbers').doc(id).get();
+      // Process in chunks to avoid Firestore transaction limits
+      for (let i = 0; i < numberIds.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        const chunk = numberIds.slice(i, i + BATCH_SIZE);
+        const priceUpdatesInChunk = {};
         
-        if (numberDoc.exists) {
-          const numberData = numberDoc.data();
+        // Get all numbers in this chunk
+        for (const id of chunk) {
+          const numberDoc = await db.collection('numbers').doc(id).get();
           
-          // If it's an available number, we need to decrement priceCount
-          if (numberData.status === 'available') {
-            const price = numberData.price.toString();
-            priceUpdates[price] = (priceUpdates[price] || 0) + 1;
-            console.log(`Price update needed: ${price} - decrement by 1`);
-          } else {
-            console.log(`Skipping price update for sold number: ${id}`);
+          if (numberDoc.exists) {
+            const numberData = numberDoc.data();
+            
+            // Track price updates for available numbers
+            if (numberData.status === 'available') {
+              const price = numberData.price.toString();
+              priceUpdatesInChunk[price] = (priceUpdatesInChunk[price] || 0) + 1;
+            }
+            
+            // Add delete operation
+            batch.delete(numberDoc.ref);
+            results.totalDeleted++;
           }
-          
-          // Add delete operation to batch
-          batch.delete(numberDoc.ref);
         }
+        
+        // Update priceCounts for this chunk
+        for (const [price, count] of Object.entries(priceUpdatesInChunk)) {
+          const priceCountRef = db.collection('priceCounts').doc(price);
+          
+          // Get current count to verify
+          const priceCountDoc = await priceCountRef.get();
+          
+          if (priceCountDoc.exists) {
+            const currentCount = priceCountDoc.data().availableCount || 0;
+            console.log(`Chunk ${i}: Price ${price} - Current: ${currentCount}, Removing: ${count}`);
+            
+            // Ensure we don't go below zero
+            if (currentCount >= count) {
+              batch.set(priceCountRef, {
+                availableCount: admin.firestore.FieldValue.increment(-count)
+              }, { merge: true });
+              
+              // Track total updates
+              results.priceUpdates[price] = (results.priceUpdates[price] || 0) + count;
+            } else {
+              console.error(`Price ${price} count (${currentCount}) less than deletion count (${count})`);
+              // Set to zero if inconsistency found
+              batch.set(priceCountRef, {
+                availableCount: 0
+              }, { merge: true });
+            }
+          } else {
+            // Create with zero if doesn't exist
+            batch.set(priceCountRef, {
+              availableCount: 0,
+              soldCount: 0
+            });
+          }
+        }
+        
+        // Commit this chunk
+        await batch.commit();
       }
       
-      // Update priceCounts for affected prices
-      for (const [price, count] of Object.entries(priceUpdates)) {
-        const priceCountRef = db.collection('priceCounts').doc(price);
-        
-        // First check if document exists
-        const priceCountDoc = await priceCountRef.get();
-        
-        if (priceCountDoc.exists) {
-          const currentCount = priceCountDoc.data().availableCount || 0;
-          console.log(`Price ${price}: Current count ${currentCount}, decrementing by ${count}`);
-          
-          batch.set(priceCountRef, {
-            availableCount: admin.firestore.FieldValue.increment(-count)
-          }, { merge: true });
-        } else {
-          console.log(`Price ${price} count document doesn't exist, creating with 0`);
-          batch.set(priceCountRef, {
-            availableCount: 0,
-            soldCount: 0
-          });
-        }
-      }
-      
-      // Commit all changes
-      await batch.commit();
-      
-      // Double-check the update by reading back
-      for (const [price, count] of Object.entries(priceUpdates)) {
+      // Final verification - read back updated counts
+      const verification = {};
+      for (const price of Object.keys(results.priceUpdates)) {
         const updatedDoc = await db.collection('priceCounts').doc(price).get();
         if (updatedDoc.exists) {
-          console.log(`After update - Price ${price}: ${updatedDoc.data().availableCount} available`);
+          verification[price] = updatedDoc.data().availableCount;
         }
       }
       
-      res.json({
+      console.log('Final price counts after deletion:', verification);
+      
+      return res.json({
         success: true,
-        message: `${numberIds.length} numbers deleted (${Object.keys(priceUpdates).length} price counts updated)`,
-        priceUpdates: priceUpdates
+        message: `${results.totalDeleted} numbers deleted successfully`,
+        priceUpdates: results.priceUpdates,
+        finalCounts: verification
       });
       
     } else {
-      res.status(400).json({ error: 'No numbers specified' });
+      return res.status(400).json({ error: 'No numbers specified' });
     }
     
   } catch (error) {
