@@ -499,7 +499,7 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       return res.status(400).json({ error: 'No valid numbers found' });
     }
     
-    // Update price count
+    // Update price count (INCREMENT availableCount)
     batch.set(priceCountRef, {
       availableCount: admin.firestore.FieldValue.increment(addedCount),
       soldCount: admin.firestore.FieldValue.increment(0)
@@ -565,7 +565,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers
+// Delete numbers - UPDATED to update priceCounts
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -576,7 +576,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
     }
     
     if (deleteAllSold) {
-      // Delete all sold numbers
+      // Delete all sold numbers - No need to update priceCounts for sold numbers
       const soldSnapshot = await db.collection('numbers')
         .where('status', '==', 'sold')
         .get();
@@ -599,18 +599,41 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       });
       
     } else if (numberIds && numberIds.length > 0) {
-      // Delete specific numbers
+      // Delete specific numbers - Need to update priceCounts for available numbers
       const batch = db.batch();
+      const priceUpdates = {}; // Track price counts to update
+      
       for (const id of numberIds) {
-        const docRef = db.collection('numbers').doc(id);
-        batch.delete(docRef);
+        // Get the number document first to know its price and status
+        const numberDoc = await db.collection('numbers').doc(id).get();
+        
+        if (numberDoc.exists) {
+          const numberData = numberDoc.data();
+          
+          // If it's an available number, we need to decrement priceCount
+          if (numberData.status === 'available') {
+            const price = numberData.price.toString();
+            priceUpdates[price] = (priceUpdates[price] || 0) + 1;
+          }
+          
+          // Delete the number document
+          batch.delete(numberDoc.ref);
+        }
+      }
+      
+      // Update priceCounts for affected prices
+      for (const [price, count] of Object.entries(priceUpdates)) {
+        const priceCountRef = db.collection('priceCounts').doc(price);
+        batch.set(priceCountRef, {
+          availableCount: admin.firestore.FieldValue.increment(-count)
+        }, { merge: true });
       }
       
       await batch.commit();
       
       res.json({
         success: true,
-        message: `${numberIds.length} numbers deleted`
+        message: `${numberIds.length} numbers deleted (${Object.keys(priceUpdates).length} price counts updated)`
       });
       
     } else {
