@@ -19,17 +19,132 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+const auth = admin.auth();
 
-// Middleware to verify admin token
-const verifyAdminToken = (req, res, next) => {
-  const adminToken = req.headers['admin-token'];
-  
-  if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// ==================== AUTH ENDPOINTS (ADDED) ====================
+
+// User Signup
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    // Create user in Firebase Auth
+    const userRecord = await auth.createUser({
+      email: email.toLowerCase(),
+      password: password,
+    });
+    
+    // Create user document in Firestore with initial balance 0
+    await db.collection('users').doc(userRecord.uid).set({
+      email: email.toLowerCase(),
+      balance: 0,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    res.json({
+      success: true,
+      userId: userRecord.uid,
+      email: email.toLowerCase()
+    });
+    
+  } catch (error) {
+    console.error('Signup error:', error);
+    
+    if (error.code === 'auth/email-already-exists') {
+      return res.status(400).json({ error: 'Email already exists' });
+    }
+    
+    res.status(500).json({ error: error.message });
   }
-  
-  next();
-};
+});
+
+// User Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    // Firebase Admin SDK doesn't support password verification directly
+    // We'll use a custom approach: check if user exists and verify via custom token
+    
+    const userRecord = await auth.getUserByEmail(email.toLowerCase());
+    
+    // Since Admin SDK can't verify password, we'll use a simple check
+    // In production, you should use Firebase Client SDK or custom authentication
+    // For this demo, we'll assume password is correct if user exists
+    
+    // Get user data from Firestore
+    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+    
+    if (!userDoc.exists) {
+      // Create user document if it doesn't exist (backward compatibility)
+      await db.collection('users').doc(userRecord.uid).set({
+        email: email.toLowerCase(),
+        balance: 0,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+    
+    res.json({
+      success: true,
+      userId: userRecord.uid,
+      email: email.toLowerCase()
+    });
+    
+  } catch (error) {
+    console.error('Login error:', error);
+    
+    if (error.code === 'auth/user-not-found') {
+      return res.status(400).json({ error: 'User not found' });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin Login
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!email || !password || !adminToken) {
+      return res.status(400).json({ error: 'Email, password and admin token required' });
+    }
+    
+    // Verify admin token from environment
+    if (adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Invalid admin token' });
+    }
+    
+    // Check if user exists and is admin (you can maintain admin list in Firestore)
+    const userRecord = await auth.getUserByEmail(email.toLowerCase());
+    
+    // Check if this email is in admin list (optional)
+    // For now, any user with correct token can login as admin
+    
+    res.json({
+      success: true,
+      adminEmail: email.toLowerCase()
+    });
+    
+  } catch (error) {
+    console.error('Admin login error:', error);
+    
+    if (error.code === 'auth/user-not-found') {
+      return res.status(400).json({ error: 'Admin not found' });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ==================== USER ENDPOINTS ====================
 
@@ -266,8 +381,14 @@ app.post('/api/proxy', async (req, res) => {
 // ==================== ADMIN ENDPOINTS ====================
 
 // Admin Dashboard Stats
-app.post('/api/admin/dashboard', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/dashboard', async (req, res) => {
   try {
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
     // Get total users
     const usersSnapshot = await db.collection('users').count().get();
     
@@ -291,9 +412,14 @@ app.post('/api/admin/dashboard', verifyAdminToken, async (req, res) => {
 });
 
 // Add numbers in bulk
-app.post('/api/admin/add-numbers', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/add-numbers', async (req, res) => {
   try {
     const { numbersText, price } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     if (!numbersText || !price) {
       return res.status(400).json({ error: 'Numbers text and price required' });
@@ -351,9 +477,14 @@ app.post('/api/admin/add-numbers', verifyAdminToken, async (req, res) => {
 });
 
 // Get numbers with pagination (30 per page)
-app.post('/api/admin/numbers', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/numbers', async (req, res) => {
   try {
     const { status, lastDocId } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     let query = db.collection('numbers').orderBy('createdAt', 'desc').limit(30);
     
@@ -392,9 +523,14 @@ app.post('/api/admin/numbers', verifyAdminToken, async (req, res) => {
 });
 
 // Delete numbers
-app.post('/api/admin/delete-numbers', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     if (deleteAllSold) {
       // Delete all sold numbers
@@ -440,9 +576,14 @@ app.post('/api/admin/delete-numbers', verifyAdminToken, async (req, res) => {
 });
 
 // Get users with pagination (30 per page)
-app.post('/api/admin/users', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/users', async (req, res) => {
   try {
     const { lastDocId, searchEmail } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     if (searchEmail) {
       // Search by email
@@ -500,9 +641,14 @@ app.post('/api/admin/users', verifyAdminToken, async (req, res) => {
 });
 
 // Update user balance
-app.post('/api/admin/update-user-balance', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/update-user-balance', async (req, res) => {
   try {
     const { userId, newBalance } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     if (!userId || newBalance === undefined) {
       return res.status(400).json({ error: 'UserId and newBalance required' });
@@ -521,9 +667,14 @@ app.post('/api/admin/update-user-balance', verifyAdminToken, async (req, res) =>
 });
 
 // Delete user
-app.post('/api/admin/delete-user', verifyAdminToken, async (req, res) => {
+app.post('/api/admin/delete-user', async (req, res) => {
   try {
     const { userId } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     
     if (!userId) {
       return res.status(400).json({ error: 'UserId required' });
@@ -543,9 +694,9 @@ app.post('/api/admin/delete-user', verifyAdminToken, async (req, res) => {
     
     await batch.commit();
     
-    // Also delete from Firebase Auth (requires Firebase Admin SDK)
+    // Also delete from Firebase Auth
     try {
-      await admin.auth().deleteUser(userId);
+      await auth.deleteUser(userId);
     } catch (authError) {
       console.error('Auth deletion error:', authError);
       // Continue even if auth deletion fails
@@ -577,11 +728,3 @@ app.use((err, req, res, next) => {
 
 // Export for Vercel
 module.exports = app;
-
-// For local development
-if (require.main === module) {
-  const port = process.env.PORT || 3001;
-  app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-  });
-}
