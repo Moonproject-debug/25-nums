@@ -31,7 +31,7 @@ try {
 const db = admin.firestore();
 const auth = admin.auth();
 
-// ==================== AUTH ENDPOINTS ====================
+// ==================== AUTH ENDPOINTS (FIXED) ====================
 
 // User Signup
 app.post('/api/auth/signup', async (req, res) => {
@@ -56,6 +56,7 @@ app.post('/api/auth/signup', async (req, res) => {
     await db.collection('users').doc(userRecord.uid).set({
       email: email.toLowerCase().trim(),
       balance: 0,
+      role: 'user', // Default role is user
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     
@@ -89,7 +90,7 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-// User Login
+// User Login - FIXED with password verification using Firebase REST API
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -98,42 +99,69 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
     
-    // Get user by email
-    const userRecord = await auth.getUserByEmail(email.toLowerCase().trim());
+    // Use Firebase REST API to verify password
+    // This is a more secure approach than Admin SDK for password verification
+    const fetch = (await import('node-fetch')).default;
     
-    // Get or create user document in Firestore
-    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+    const apiKey = process.env.FIREBASE_API_KEY; // You need to add this to env vars
+    const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: email.toLowerCase().trim(),
+        password: password,
+        returnSecureToken: true
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok) {
+      console.error('Firebase auth error:', data.error);
+      
+      if (data.error.message === 'EMAIL_NOT_FOUND') {
+        return res.status(400).json({ error: 'User not found' });
+      }
+      
+      if (data.error.message === 'INVALID_PASSWORD') {
+        return res.status(400).json({ error: 'Invalid password' });
+      }
+      
+      if (data.error.message === 'USER_DISABLED') {
+        return res.status(400).json({ error: 'User account disabled' });
+      }
+      
+      return res.status(400).json({ error: 'Login failed: ' + data.error.message });
+    }
+    
+    // Get user document from Firestore
+    const userDoc = await db.collection('users').doc(data.localId).get();
     
     if (!userDoc.exists) {
       // Create user document if it doesn't exist
-      await db.collection('users').doc(userRecord.uid).set({
+      await db.collection('users').doc(data.localId).set({
         email: email.toLowerCase().trim(),
         balance: 0,
+        role: 'user',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     }
     
     res.json({
       success: true,
-      userId: userRecord.uid,
+      userId: data.localId,
       email: email.toLowerCase().trim()
     });
     
   } catch (error) {
     console.error('Login error details:', error);
-    
-    if (error.code === 'auth/user-not-found') {
-      return res.status(400).json({ error: 'User not found' });
-    }
-    
     res.status(500).json({ 
-      error: 'Login failed: ' + error.message,
-      code: error.code 
+      error: 'Login failed: ' + error.message
     });
   }
 });
 
-// Admin Login
+// Admin Login - FIXED with role verification
 app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -148,25 +176,61 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid admin token' });
     }
     
-    // Get user by email
-    const userRecord = await auth.getUserByEmail(email.toLowerCase().trim());
+    // Use Firebase REST API to verify password
+    const fetch = (await import('node-fetch')).default;
     
-    // Set admin custom claim
-    await auth.setCustomUserClaims(userRecord.uid, { admin: true });
+    const apiKey = process.env.FIREBASE_API_KEY;
+    const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: email.toLowerCase().trim(),
+        password: password,
+        returnSecureToken: true
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok) {
+      console.error('Firebase auth error:', data.error);
+      
+      if (data.error.message === 'EMAIL_NOT_FOUND') {
+        return res.status(400).json({ error: 'Admin not found' });
+      }
+      
+      if (data.error.message === 'INVALID_PASSWORD') {
+        return res.status(400).json({ error: 'Invalid password' });
+      }
+      
+      return res.status(400).json({ error: 'Login failed: ' + data.error.message });
+    }
+    
+    // Check if user has admin role in Firestore
+    const userDoc = await db.collection('users').doc(data.localId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(403).json({ error: 'User not found in database' });
+    }
+    
+    const userData = userDoc.data();
+    
+    // Check if role is admin
+    if (!userData.role || userData.role !== 'admin') {
+      return res.status(403).json({ error: 'Not authorized as admin' });
+    }
+    
+    // Set admin custom claim (optional)
+    await auth.setCustomUserClaims(data.localId, { admin: true });
     
     res.json({
       success: true,
       adminEmail: email.toLowerCase().trim(),
-      userId: userRecord.uid
+      userId: data.localId
     });
     
   } catch (error) {
     console.error('Admin login error:', error);
-    
-    if (error.code === 'auth/user-not-found') {
-      return res.status(400).json({ error: 'Admin not found' });
-    }
-    
     res.status(500).json({ error: 'Admin login failed: ' + error.message });
   }
 });
@@ -561,7 +625,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers - COMPLETELY FIXED VERSION
+// Delete numbers - FIXED batch processing
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -572,7 +636,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
     }
     
     if (deleteAllSold) {
-      // Delete all sold numbers - No need to update priceCounts for sold numbers
+      // Delete all sold numbers
       const soldSnapshot = await db.collection('numbers')
         .where('status', '==', 'sold')
         .get();
@@ -595,14 +659,14 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       });
       
     } else if (numberIds && numberIds.length > 0) {
-      // Delete specific numbers - FIXED: Process in smaller batches to avoid transaction limits
-      const BATCH_SIZE = 10; // Process 10 numbers at a time
+      // Delete specific numbers
+      const BATCH_SIZE = 10;
       const results = {
         totalDeleted: 0,
         priceUpdates: {}
       };
       
-      // Process in chunks to avoid Firestore transaction limits
+      // Process in chunks
       for (let i = 0; i < numberIds.length; i += BATCH_SIZE) {
         const batch = db.batch();
         const chunk = numberIds.slice(i, i + BATCH_SIZE);
@@ -636,25 +700,20 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
           
           if (priceCountDoc.exists) {
             const currentCount = priceCountDoc.data().availableCount || 0;
-            console.log(`Chunk ${i}: Price ${price} - Current: ${currentCount}, Removing: ${count}`);
+            console.log(`Price ${price}: Current ${currentCount}, Removing ${count}`);
             
-            // Ensure we don't go below zero
             if (currentCount >= count) {
               batch.set(priceCountRef, {
                 availableCount: admin.firestore.FieldValue.increment(-count)
               }, { merge: true });
               
-              // Track total updates
               results.priceUpdates[price] = (results.priceUpdates[price] || 0) + count;
             } else {
-              console.error(`Price ${price} count (${currentCount}) less than deletion count (${count})`);
-              // Set to zero if inconsistency found
               batch.set(priceCountRef, {
                 availableCount: 0
               }, { merge: true });
             }
           } else {
-            // Create with zero if doesn't exist
             batch.set(priceCountRef, {
               availableCount: 0,
               soldCount: 0
@@ -666,22 +725,10 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         await batch.commit();
       }
       
-      // Final verification - read back updated counts
-      const verification = {};
-      for (const price of Object.keys(results.priceUpdates)) {
-        const updatedDoc = await db.collection('priceCounts').doc(price).get();
-        if (updatedDoc.exists) {
-          verification[price] = updatedDoc.data().availableCount;
-        }
-      }
-      
-      console.log('Final price counts after deletion:', verification);
-      
       return res.json({
         success: true,
         message: `${results.totalDeleted} numbers deleted successfully`,
-        priceUpdates: results.priceUpdates,
-        finalCounts: verification
+        priceUpdates: results.priceUpdates
       });
       
     } else {
@@ -717,6 +764,7 @@ app.post('/api/admin/users', async (req, res) => {
           id: doc.id,
           email: doc.data().email,
           balance: doc.data().balance || 0,
+          role: doc.data().role || 'user',
           createdAt: doc.data().createdAt
         });
       });
@@ -742,6 +790,7 @@ app.post('/api/admin/users', async (req, res) => {
         id: doc.id,
         email: doc.data().email,
         balance: doc.data().balance || 0,
+        role: doc.data().role || 'user',
         createdAt: doc.data().createdAt
       });
       lastId = doc.id;
