@@ -15,7 +15,6 @@ try {
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
   };
 
-  // Check if required env vars exist
   if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_PRIVATE_KEY || !process.env.FIREBASE_CLIENT_EMAIL) {
     console.error('Missing Firebase environment variables');
   } else {
@@ -31,7 +30,65 @@ try {
 const db = admin.firestore();
 const auth = admin.auth();
 
-// ==================== AUTH ENDPOINTS (FIXED) ====================
+// ==================== CORRECT DOMAIN FOR VERCEL API ====================
+const CORRECT_API_DOMAIN = 'moonusaphysical.vercel.app';
+
+// Function to convert any API URL to correct Vercel domain format
+function convertToVercelApiUrl(apiUrl, number) {
+  if (!apiUrl) return apiUrl;
+  
+  // Try to extract token from URL
+  let token = null;
+  let tpl = null;
+  
+  // Extract token from various formats
+  const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
+  if (tokenMatch) {
+    token = tokenMatch[1];
+  }
+  
+  // Extract tpl parameter if exists
+  const tplMatch = apiUrl.match(/[?&]tpl=([^&]+)/);
+  if (tplMatch) {
+    tpl = tplMatch[1];
+  }
+  
+  // Extract any other parameters
+  const params = {};
+  const urlParams = apiUrl.split('?')[1];
+  if (urlParams) {
+    urlParams.split('&').forEach(param => {
+      const [key, value] = param.split('=');
+      if (key !== 'token' && key !== 'tpl' && value) {
+        params[key] = value;
+      }
+    });
+  }
+  
+  // Build corrected URL
+  let correctedUrl = `https://${CORRECT_API_DOMAIN}/api`;
+  const queryParams = [];
+  
+  if (token) {
+    queryParams.push(`token=${token}`);
+  }
+  if (tpl) {
+    queryParams.push(`tpl=${tpl}`);
+  }
+  
+  // Add other parameters
+  for (const [key, value] of Object.entries(params)) {
+    queryParams.push(`${key}=${value}`);
+  }
+  
+  if (queryParams.length > 0) {
+    correctedUrl += '?' + queryParams.join('&');
+  }
+  
+  return correctedUrl;
+}
+
+// ==================== AUTH ENDPOINTS ====================
 
 // User Signup
 app.post('/api/auth/signup', async (req, res) => {
@@ -46,17 +103,15 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
     
-    // Create user in Firebase Auth
     const userRecord = await auth.createUser({
       email: email.toLowerCase().trim(),
       password: password,
     });
     
-    // Create user document in Firestore with initial balance 0
     await db.collection('users').doc(userRecord.uid).set({
       email: email.toLowerCase().trim(),
       balance: 0,
-      role: 'user', // Default role is user
+      role: 'user',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     
@@ -90,7 +145,7 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-// User Login - FIXED with password verification using Firebase REST API
+// User Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -99,11 +154,9 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
     
-    // Use Firebase REST API to verify password
-    // This is a more secure approach than Admin SDK for password verification
     const fetch = (await import('node-fetch')).default;
     
-    const apiKey = process.env.FIREBASE_API_KEY; // You need to add this to env vars
+    const apiKey = process.env.FIREBASE_API_KEY;
     const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -134,11 +187,9 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Login failed: ' + data.error.message });
     }
     
-    // Get user document from Firestore
     const userDoc = await db.collection('users').doc(data.localId).get();
     
     if (!userDoc.exists) {
-      // Create user document if it doesn't exist
       await db.collection('users').doc(data.localId).set({
         email: email.toLowerCase().trim(),
         balance: 0,
@@ -161,7 +212,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Admin Login - FIXED with role verification
+// Admin Login
 app.post('/api/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -171,12 +222,10 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(400).json({ error: 'Email, password and admin token required' });
     }
     
-    // Verify admin token from environment
     if (adminToken !== process.env.ADMIN_SECRET_TOKEN) {
       return res.status(401).json({ error: 'Invalid admin token' });
     }
     
-    // Use Firebase REST API to verify password
     const fetch = (await import('node-fetch')).default;
     
     const apiKey = process.env.FIREBASE_API_KEY;
@@ -206,7 +255,6 @@ app.post('/api/admin/login', async (req, res) => {
       return res.status(400).json({ error: 'Login failed: ' + data.error.message });
     }
     
-    // Check if user has admin role in Firestore
     const userDoc = await db.collection('users').doc(data.localId).get();
     
     if (!userDoc.exists) {
@@ -215,12 +263,10 @@ app.post('/api/admin/login', async (req, res) => {
     
     const userData = userDoc.data();
     
-    // Check if role is admin
     if (!userData.role || userData.role !== 'admin') {
       return res.status(403).json({ error: 'Not authorized as admin' });
     }
     
-    // Set admin custom claim (optional)
     await auth.setCustomUserClaims(data.localId, { admin: true });
     
     res.json({
@@ -246,7 +292,6 @@ app.post('/api/user/dashboard', async (req, res) => {
       return res.status(400).json({ error: 'UserId required' });
     }
     
-    // Get user balance
     const userDoc = await db.collection('users').doc(userId).get();
     
     if (!userDoc.exists) {
@@ -255,7 +300,6 @@ app.post('/api/user/dashboard', async (req, res) => {
     
     const userData = userDoc.data();
     
-    // Get all price counts
     const priceCountsSnapshot = await db.collection('priceCounts').get();
     
     const priceList = [];
@@ -269,7 +313,6 @@ app.post('/api/user/dashboard', async (req, res) => {
       }
     });
     
-    // Sort by price
     priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
     res.json({
@@ -295,9 +338,7 @@ app.post('/api/user/buy-number', async (req, res) => {
     
     const priceStr = price.toString();
     
-    // Run transaction
     const result = await db.runTransaction(async (transaction) => {
-      // Get user data
       const userRef = db.collection('users').doc(userId);
       const userDoc = await transaction.get(userRef);
       
@@ -307,12 +348,10 @@ app.post('/api/user/buy-number', async (req, res) => {
       
       const userData = userDoc.data();
       
-      // Check balance
       if (userData.balance < parseInt(priceStr)) {
         throw new Error('Insufficient balance');
       }
       
-      // Get price count
       const priceCountRef = db.collection('priceCounts').doc(priceStr);
       const priceCountDoc = await transaction.get(priceCountRef);
       
@@ -320,7 +359,6 @@ app.post('/api/user/buy-number', async (req, res) => {
         throw new Error('No numbers available at this price');
       }
       
-      // Find available number
       const numbersQuery = await db.collection('numbers')
         .where('price', '==', priceStr)
         .where('status', '==', 'available')
@@ -334,25 +372,21 @@ app.post('/api/user/buy-number', async (req, res) => {
       const numberDoc = numbersQuery.docs[0];
       const numberData = numberDoc.data();
       
-      // Update number status
       transaction.update(numberDoc.ref, { 
         status: 'sold',
         soldTo: userId,
         soldAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Update price count
       transaction.update(priceCountRef, {
         availableCount: admin.firestore.FieldValue.increment(-1),
         soldCount: admin.firestore.FieldValue.increment(1)
       });
       
-      // Update user balance
       transaction.update(userRef, {
         balance: admin.firestore.FieldValue.increment(-parseInt(priceStr))
       });
       
-      // Add to user's purchased numbers
       const userNumberRef = db.collection('users').doc(userId).collection('purchased').doc(numberDoc.id);
       transaction.set(userNumberRef, {
         number: numberData.number,
@@ -447,7 +481,6 @@ app.post('/api/proxy', async (req, res) => {
       return res.status(400).json({ error: 'URL required' });
     }
     
-    // Use dynamic import for node-fetch
     const fetch = (await import('node-fetch')).default;
     
     const response = await fetch(url, {
@@ -480,18 +513,15 @@ app.post('/api/admin/dashboard', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Get total users count
     const usersSnapshot = await db.collection('users').count().get();
     const totalUsers = usersSnapshot.data().count || 0;
     
-    // Get available numbers count
     const availableSnapshot = await db.collection('numbers')
       .where('status', '==', 'available')
       .count()
       .get();
     const availableNumbers = availableSnapshot.data().count || 0;
     
-    // Get sold numbers count
     const soldSnapshot = await db.collection('numbers')
       .where('status', '==', 'sold')
       .count()
@@ -510,10 +540,10 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// Add numbers in bulk
+// ==================== ADD NUMBERS WITH TYPE SUPPORT ====================
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
-    const { numbersText, price } = req.body;
+    const { numbersText, price, numberType } = req.body;
     const adminToken = req.headers['admin-token'];
     
     if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
@@ -535,11 +565,23 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
       
-      const parts = trimmedLine.split('|');
-      if (parts.length !== 2) continue;
+      let number, apiUrl;
+      let numberTypeUsed = numberType || 'default';
       
-      const number = parts[0].trim();
-      const apiUrl = parts[1].trim();
+      // Check if line contains pipe separator
+      if (trimmedLine.includes('|')) {
+        const parts = trimmedLine.split('|');
+        number = parts[0].trim();
+        apiUrl = parts[1].trim();
+        
+        // If number type is 'vercel', convert URL to correct domain
+        if (numberTypeUsed === 'vercel') {
+          apiUrl = convertToVercelApiUrl(apiUrl, number);
+        }
+      } else {
+        // Default format - just number without API? Skip
+        continue;
+      }
       
       if (!number || !apiUrl) continue;
       
@@ -549,6 +591,7 @@ app.post('/api/admin/add-numbers', async (req, res) => {
         apiUrl,
         price: priceStr,
         status: 'available',
+        numberType: numberTypeUsed,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
@@ -556,10 +599,9 @@ app.post('/api/admin/add-numbers', async (req, res) => {
     }
     
     if (addedCount === 0) {
-      return res.status(400).json({ error: 'No valid numbers found' });
+      return res.status(400).json({ error: 'No valid numbers found. Use format: number|apiUrl' });
     }
     
-    // Update price count (INCREMENT availableCount)
     batch.set(priceCountRef, {
       availableCount: admin.firestore.FieldValue.increment(addedCount),
       soldCount: admin.firestore.FieldValue.increment(0)
@@ -625,7 +667,7 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers - FIXED batch processing
+// Delete numbers
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -636,7 +678,6 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
     }
     
     if (deleteAllSold) {
-      // Delete all sold numbers
       const soldSnapshot = await db.collection('numbers')
         .where('status', '==', 'sold')
         .get();
@@ -659,49 +700,39 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       });
       
     } else if (numberIds && numberIds.length > 0) {
-      // Delete specific numbers
       const BATCH_SIZE = 10;
       const results = {
         totalDeleted: 0,
         priceUpdates: {}
       };
       
-      // Process in chunks
       for (let i = 0; i < numberIds.length; i += BATCH_SIZE) {
         const batch = db.batch();
         const chunk = numberIds.slice(i, i + BATCH_SIZE);
         const priceUpdatesInChunk = {};
         
-        // Get all numbers in this chunk
         for (const id of chunk) {
           const numberDoc = await db.collection('numbers').doc(id).get();
           
           if (numberDoc.exists) {
             const numberData = numberDoc.data();
             
-            // Track price updates for available numbers
             if (numberData.status === 'available') {
               const price = numberData.price.toString();
               priceUpdatesInChunk[price] = (priceUpdatesInChunk[price] || 0) + 1;
             }
             
-            // Add delete operation
             batch.delete(numberDoc.ref);
             results.totalDeleted++;
           }
         }
         
-        // Update priceCounts for this chunk
         for (const [price, count] of Object.entries(priceUpdatesInChunk)) {
           const priceCountRef = db.collection('priceCounts').doc(price);
-          
-          // Get current count to verify
           const priceCountDoc = await priceCountRef.get();
           
           if (priceCountDoc.exists) {
             const currentCount = priceCountDoc.data().availableCount || 0;
-            console.log(`Price ${price}: Current ${currentCount}, Removing ${count}`);
-            
             if (currentCount >= count) {
               batch.set(priceCountRef, {
                 availableCount: admin.firestore.FieldValue.increment(-count)
@@ -721,7 +752,6 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
           }
         }
         
-        // Commit this chunk
         await batch.commit();
       }
       
@@ -752,7 +782,6 @@ app.post('/api/admin/users', async (req, res) => {
     }
     
     if (searchEmail) {
-      // Search by email
       const snapshot = await db.collection('users')
         .where('email', '==', searchEmail.toLowerCase().trim())
         .limit(1)
@@ -772,7 +801,6 @@ app.post('/api/admin/users', async (req, res) => {
       return res.json({ users, lastDocId: null, hasMore: false });
     }
     
-    // Paginated users
     let query = db.collection('users').orderBy('createdAt', 'desc').limit(30);
     
     if (lastDocId) {
@@ -852,7 +880,6 @@ app.post('/api/admin/delete-user', async (req, res) => {
       return res.status(400).json({ error: 'UserId required' });
     }
     
-    // Delete user's purchased numbers subcollection
     const purchasedSnapshot = await db.collection('users').doc(userId)
       .collection('purchased').get();
     
@@ -861,12 +888,10 @@ app.post('/api/admin/delete-user', async (req, res) => {
       batch.delete(doc.ref);
     });
     
-    // Delete user document
     batch.delete(db.collection('users').doc(userId));
     
     await batch.commit();
     
-    // Delete from Firebase Auth
     try {
       await auth.deleteUser(userId);
     } catch (authError) {
@@ -926,5 +951,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Export for Vercel
 module.exports = app;
