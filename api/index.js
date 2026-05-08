@@ -30,10 +30,12 @@ try {
 const db = admin.firestore();
 const auth = admin.auth();
 
-// ==================== CORRECT DOMAIN FOR VERCEL API ====================
-const CORRECT_API_DOMAIN = 'moonusaphysical.vercel.app';
+// ==================== CORRECT DOMAINS FOR DIFFERENT API TYPES ====================
+const VERCELL_API_DOMAIN = 'moonusaphysical.vercel.app';
+const APSMS_API_DOMAIN = 'moonusnumsphysical2.usanumbersdaily.workers.dev';
+const DEFAULT_API_DOMAIN = 'moonus.usanumbersdaily.workers.dev';
 
-// Function to convert any API URL to correct Vercel domain format
+// Function to convert any API URL to Vercel domain format
 function convertToVercelApiUrl(apiUrl, number) {
   if (!apiUrl) return apiUrl;
   
@@ -45,6 +47,12 @@ function convertToVercelApiUrl(apiUrl, number) {
   const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
   if (tokenMatch) {
     token = tokenMatch[1];
+  }
+  
+  // Extract key parameter (for APSMS format)
+  const keyMatch = apiUrl.match(/[?&]key=([^&]+)/);
+  if (keyMatch && !token) {
+    token = keyMatch[1];
   }
   
   // Extract tpl parameter if exists
@@ -59,14 +67,14 @@ function convertToVercelApiUrl(apiUrl, number) {
   if (urlParams) {
     urlParams.split('&').forEach(param => {
       const [key, value] = param.split('=');
-      if (key !== 'token' && key !== 'tpl' && value) {
+      if (key !== 'token' && key !== 'tpl' && key !== 'key' && value) {
         params[key] = value;
       }
     });
   }
   
   // Build corrected URL
-  let correctedUrl = `https://${CORRECT_API_DOMAIN}/api`;
+  let correctedUrl = `https://${VERCELL_API_DOMAIN}/api`;
   const queryParams = [];
   
   if (token) {
@@ -86,6 +94,54 @@ function convertToVercelApiUrl(apiUrl, number) {
   }
   
   return correctedUrl;
+}
+
+// Function to convert any API URL to APSMS domain format
+function convertToAPSMSApiUrl(apiUrl, number) {
+  if (!apiUrl) return apiUrl;
+  
+  // Try to extract key/token from URL
+  let key = null;
+  
+  // Extract key from various formats
+  const keyMatch = apiUrl.match(/[?&]key=([^&]+)/);
+  if (keyMatch) {
+    key = keyMatch[1];
+  }
+  
+  // If no key, try token
+  if (!key) {
+    const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
+    if (tokenMatch) {
+      key = tokenMatch[1];
+    }
+  }
+  
+  // Build corrected URL for APSMS domain
+  if (key) {
+    return `https://${APSMS_API_DOMAIN}/?key=${key}`;
+  }
+  
+  // If no key found, return original but ensure domain is correct
+  return apiUrl;
+}
+
+// Function for default worker domain
+function convertToDefaultApiUrl(apiUrl, number) {
+  if (!apiUrl) return apiUrl;
+  
+  // Extract token
+  let token = null;
+  const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
+  if (tokenMatch) {
+    token = tokenMatch[1];
+  }
+  
+  if (token) {
+    return `https://${DEFAULT_API_DOMAIN}?token=${token}`;
+  }
+  
+  return apiUrl;
 }
 
 // ==================== AUTH ENDPOINTS ====================
@@ -392,6 +448,7 @@ app.post('/api/user/buy-number', async (req, res) => {
         number: numberData.number,
         apiUrl: numberData.apiUrl,
         price: priceStr,
+        numberType: numberData.numberType || 'default',
         purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
         status: 'active'
       });
@@ -399,7 +456,8 @@ app.post('/api/user/buy-number', async (req, res) => {
       return {
         numberId: numberDoc.id,
         number: numberData.number,
-        apiUrl: numberData.apiUrl
+        apiUrl: numberData.apiUrl,
+        numberType: numberData.numberType || 'default'
       };
     });
     
@@ -407,7 +465,8 @@ app.post('/api/user/buy-number', async (req, res) => {
       success: true,
       number: result.number,
       numberId: result.numberId,
-      apiUrl: result.apiUrl
+      apiUrl: result.apiUrl,
+      numberType: result.numberType
     });
     
   } catch (error) {
@@ -540,7 +599,7 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// ==================== ADD NUMBERS WITH TYPE SUPPORT ====================
+// ==================== ADD NUMBERS WITH 3 TYPE SUPPORT ====================
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
     const { numbersText, price, numberType } = req.body;
@@ -574,9 +633,14 @@ app.post('/api/admin/add-numbers', async (req, res) => {
         number = parts[0].trim();
         apiUrl = parts[1].trim();
         
-        // If number type is 'vercel', convert URL to correct domain
+        // Convert URL based on number type
         if (numberTypeUsed === 'vercel') {
           apiUrl = convertToVercelApiUrl(apiUrl, number);
+        } else if (numberTypeUsed === 'apsms') {
+          apiUrl = convertToAPSMSApiUrl(apiUrl, number);
+        } else {
+          // Default type
+          apiUrl = convertToDefaultApiUrl(apiUrl, number);
         }
       } else {
         // Default format - just number without API? Skip
@@ -915,12 +979,21 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Version endpoint for cache busting
+app.get('/api/version', (req, res) => {
+  res.json({ 
+    version: '1.0.3',
+    timestamp: Date.now()
+  });
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
     message: 'USA Nums by Moon API',
     endpoints: [
       '/api/health',
+      '/api/version',
       '/api/auth/signup',
       '/api/auth/login',
       '/api/admin/login',
