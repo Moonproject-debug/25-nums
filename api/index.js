@@ -30,120 +30,6 @@ try {
 const db = admin.firestore();
 const auth = admin.auth();
 
-// ==================== CORRECT DOMAINS FOR DIFFERENT API TYPES ====================
-const VERCELL_API_DOMAIN = 'moonusaphysical.vercel.app';
-const APSMS_API_DOMAIN = 'moonusnumsphysical2.usanumbersdaily.workers.dev';
-const DEFAULT_API_DOMAIN = 'moonus.usanumbersdaily.workers.dev';
-
-// Function to convert any API URL to Vercel domain format
-function convertToVercelApiUrl(apiUrl, number) {
-  if (!apiUrl) return apiUrl;
-  
-  // Try to extract token from URL
-  let token = null;
-  let tpl = null;
-  
-  // Extract token from various formats
-  const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
-  if (tokenMatch) {
-    token = tokenMatch[1];
-  }
-  
-  // Extract key parameter (for APSMS format)
-  const keyMatch = apiUrl.match(/[?&]key=([^&]+)/);
-  if (keyMatch && !token) {
-    token = keyMatch[1];
-  }
-  
-  // Extract tpl parameter if exists
-  const tplMatch = apiUrl.match(/[?&]tpl=([^&]+)/);
-  if (tplMatch) {
-    tpl = tplMatch[1];
-  }
-  
-  // Extract any other parameters
-  const params = {};
-  const urlParams = apiUrl.split('?')[1];
-  if (urlParams) {
-    urlParams.split('&').forEach(param => {
-      const [key, value] = param.split('=');
-      if (key !== 'token' && key !== 'tpl' && key !== 'key' && value) {
-        params[key] = value;
-      }
-    });
-  }
-  
-  // Build corrected URL
-  let correctedUrl = `https://${VERCELL_API_DOMAIN}/api`;
-  const queryParams = [];
-  
-  if (token) {
-    queryParams.push(`token=${token}`);
-  }
-  if (tpl) {
-    queryParams.push(`tpl=${tpl}`);
-  }
-  
-  // Add other parameters
-  for (const [key, value] of Object.entries(params)) {
-    queryParams.push(`${key}=${value}`);
-  }
-  
-  if (queryParams.length > 0) {
-    correctedUrl += '?' + queryParams.join('&');
-  }
-  
-  return correctedUrl;
-}
-
-// Function to convert any API URL to APSMS domain format
-function convertToAPSMSApiUrl(apiUrl, number) {
-  if (!apiUrl) return apiUrl;
-  
-  // Try to extract key/token from URL
-  let key = null;
-  
-  // Extract key from various formats
-  const keyMatch = apiUrl.match(/[?&]key=([^&]+)/);
-  if (keyMatch) {
-    key = keyMatch[1];
-  }
-  
-  // If no key, try token
-  if (!key) {
-    const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
-    if (tokenMatch) {
-      key = tokenMatch[1];
-    }
-  }
-  
-  // Build corrected URL for APSMS domain
-  if (key) {
-    return `https://${APSMS_API_DOMAIN}/?key=${key}`;
-  }
-  
-  // If no key found, return original but ensure domain is correct
-  return apiUrl;
-}
-
-// Function for default worker domain
-function convertToDefaultApiUrl(apiUrl, number) {
-  if (!apiUrl) return apiUrl;
-  
-  // Extract token
-  let token = null;
-  const tokenMatch = apiUrl.match(/[?&]token=([^&]+)/);
-  if (tokenMatch) {
-    token = tokenMatch[1];
-  }
-  
-  if (token) {
-    return `https://${DEFAULT_API_DOMAIN}?token=${token}`;
-  }
-  
-  return apiUrl;
-}
-
 // ==================== AUTH ENDPOINTS ====================
 
 // User Signup
@@ -448,7 +334,6 @@ app.post('/api/user/buy-number', async (req, res) => {
         number: numberData.number,
         apiUrl: numberData.apiUrl,
         price: priceStr,
-        numberType: numberData.numberType || 'default',
         purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
         status: 'active'
       });
@@ -456,8 +341,7 @@ app.post('/api/user/buy-number', async (req, res) => {
       return {
         numberId: numberDoc.id,
         number: numberData.number,
-        apiUrl: numberData.apiUrl,
-        numberType: numberData.numberType || 'default'
+        apiUrl: numberData.apiUrl
       };
     });
     
@@ -465,8 +349,7 @@ app.post('/api/user/buy-number', async (req, res) => {
       success: true,
       number: result.number,
       numberId: result.numberId,
-      apiUrl: result.apiUrl,
-      numberType: result.numberType
+      apiUrl: result.apiUrl
     });
     
   } catch (error) {
@@ -599,10 +482,10 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// ==================== ADD NUMBERS WITH 3 TYPE SUPPORT ====================
+// ==================== ADD NUMBERS - DIRECT STORAGE (NO CONVERSION) ====================
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
-    const { numbersText, price, numberType } = req.body;
+    const { numbersText, price } = req.body;
     const adminToken = req.headers['admin-token'];
     
     if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
@@ -625,25 +508,14 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       if (!trimmedLine) continue;
       
       let number, apiUrl;
-      let numberTypeUsed = numberType || 'default';
       
       // Check if line contains pipe separator
       if (trimmedLine.includes('|')) {
         const parts = trimmedLine.split('|');
         number = parts[0].trim();
         apiUrl = parts[1].trim();
-        
-        // Convert URL based on number type
-        if (numberTypeUsed === 'vercel') {
-          apiUrl = convertToVercelApiUrl(apiUrl, number);
-        } else if (numberTypeUsed === 'apsms') {
-          apiUrl = convertToAPSMSApiUrl(apiUrl, number);
-        } else {
-          // Default type
-          apiUrl = convertToDefaultApiUrl(apiUrl, number);
-        }
       } else {
-        // Default format - just number without API? Skip
+        // Invalid format - skip
         continue;
       }
       
@@ -652,10 +524,9 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       const numberRef = db.collection('numbers').doc();
       batch.set(numberRef, {
         number,
-        apiUrl,
+        apiUrl,  // Store EXACTLY as provided, NO conversion
         price: priceStr,
         status: 'available',
-        numberType: numberTypeUsed,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
@@ -982,7 +853,7 @@ app.get('/api/health', (req, res) => {
 // Version endpoint for cache busting
 app.get('/api/version', (req, res) => {
   res.json({ 
-    version: '1.0.3',
+    version: '2.0.0',
     timestamp: Date.now()
   });
 });
