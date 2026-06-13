@@ -225,7 +225,7 @@ app.post('/api/admin/login', async (req, res) => {
 
 // ==================== USER ENDPOINTS ====================
 
-// Get user balance and price list
+// Get user balance and price list (VERIFICATION numbers)
 app.post('/api/user/dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -269,7 +269,199 @@ app.post('/api/user/dashboard', async (req, res) => {
   }
 });
 
-// Buy number
+// ==================== FB ID CREATION NUMBERS ENDPOINTS ====================
+
+// Get user balance and FB price list (CREATION numbers)
+app.post('/api/user/fb-dashboard', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+    
+    const userDoc = await db.collection('users').doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    
+    const fbPriceCountsSnapshot = await db.collection('fbPriceCounts').get();
+    
+    const fbPriceList = [];
+    fbPriceCountsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.availableCount > 0) {
+        fbPriceList.push({
+          price: doc.id,
+          availableCount: data.availableCount
+        });
+      }
+    });
+    
+    fbPriceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
+    
+    res.json({
+      balance: userData.balance || 0,
+      email: userData.email,
+      fbPriceList
+    });
+    
+  } catch (error) {
+    console.error('FB Dashboard error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Buy FB ID Creation number
+app.post('/api/user/buy-fb-number', async (req, res) => {
+  try {
+    const { userId, price } = req.body;
+    
+    if (!userId || !price) {
+      return res.status(400).json({ error: 'UserId and price required' });
+    }
+    
+    const priceStr = price.toString();
+    
+    const result = await db.runTransaction(async (transaction) => {
+      const userRef = db.collection('users').doc(userId);
+      const userDoc = await transaction.get(userRef);
+      
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+      
+      const userData = userDoc.data();
+      
+      if (userData.balance < parseInt(priceStr)) {
+        throw new Error('Insufficient balance');
+      }
+      
+      const fbPriceCountRef = db.collection('fbPriceCounts').doc(priceStr);
+      const fbPriceCountDoc = await transaction.get(fbPriceCountRef);
+      
+      if (!fbPriceCountDoc.exists || fbPriceCountDoc.data().availableCount === 0) {
+        throw new Error('No FB numbers available at this price');
+      }
+      
+      const numbersQuery = await db.collection('fbNumbers')
+        .where('price', '==', priceStr)
+        .where('status', '==', 'available')
+        .limit(1)
+        .get();
+      
+      if (numbersQuery.empty) {
+        throw new Error('No FB numbers available');
+      }
+      
+      const numberDoc = numbersQuery.docs[0];
+      const numberData = numberDoc.data();
+      
+      transaction.update(numberDoc.ref, { 
+        status: 'sold',
+        soldTo: userId,
+        soldAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      transaction.update(fbPriceCountRef, {
+        availableCount: admin.firestore.FieldValue.increment(-1),
+        soldCount: admin.firestore.FieldValue.increment(1)
+      });
+      
+      transaction.update(userRef, {
+        balance: admin.firestore.FieldValue.increment(-parseInt(priceStr))
+      });
+      
+      const userNumberRef = db.collection('users').doc(userId).collection('fbPurchased').doc(numberDoc.id);
+      transaction.set(userNumberRef, {
+        number: numberData.number,
+        apiUrl: numberData.apiUrl,
+        price: priceStr,
+        purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: 'active',
+        type: 'fb-creation'
+      });
+      
+      return {
+        numberId: numberDoc.id,
+        number: numberData.number,
+        apiUrl: numberData.apiUrl
+      };
+    });
+    
+    res.json({
+      success: true,
+      number: result.number,
+      numberId: result.numberId,
+      apiUrl: result.apiUrl
+    });
+    
+  } catch (error) {
+    console.error('Buy FB number error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get user's purchased FB numbers
+app.post('/api/user/my-fb-numbers', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+    
+    const purchasedSnapshot = await db.collection('users').doc(userId)
+      .collection('fbPurchased')
+      .where('status', '==', 'active')
+      .orderBy('purchasedAt', 'desc')
+      .get();
+    
+    const numbers = [];
+    purchasedSnapshot.forEach(doc => {
+      numbers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
+    res.json({ numbers });
+    
+  } catch (error) {
+    console.error('Get my FB numbers error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete user's purchased FB number
+app.post('/api/user/delete-fb-number', async (req, res) => {
+  try {
+    const { userId, numberId } = req.body;
+    
+    if (!userId || !numberId) {
+      return res.status(400).json({ error: 'UserId and numberId required' });
+    }
+    
+    const userNumberRef = db.collection('users').doc(userId)
+      .collection('fbPurchased').doc(numberId);
+    
+    await userNumberRef.update({
+      status: 'deleted',
+      deletedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('Delete FB number error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Buy VERIFICATION number (existing)
 app.post('/api/user/buy-number', async (req, res) => {
   try {
     const { userId, price } = req.body;
@@ -335,7 +527,8 @@ app.post('/api/user/buy-number', async (req, res) => {
         apiUrl: numberData.apiUrl,
         price: priceStr,
         purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: 'active'
+        status: 'active',
+        type: 'verification'
       });
       
       return {
@@ -358,7 +551,7 @@ app.post('/api/user/buy-number', async (req, res) => {
   }
 });
 
-// Get user's purchased numbers
+// Get user's purchased VERIFICATION numbers
 app.post('/api/user/my-numbers', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -389,7 +582,7 @@ app.post('/api/user/my-numbers', async (req, res) => {
   }
 });
 
-// Delete user's purchased number
+// Delete user's purchased VERIFICATION number
 app.post('/api/user/delete-number', async (req, res) => {
   try {
     const { userId, numberId } = req.body;
@@ -482,7 +675,7 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// ==================== ADD NUMBERS - DIRECT STORAGE (NO CONVERSION) ====================
+// ==================== ADD VERIFICATION NUMBERS ====================
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
     const { numbersText, price } = req.body;
@@ -509,13 +702,11 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       
       let number, apiUrl;
       
-      // Check if line contains pipe separator
       if (trimmedLine.includes('|')) {
         const parts = trimmedLine.split('|');
         number = parts[0].trim();
         apiUrl = parts[1].trim();
       } else {
-        // Invalid format - skip
         continue;
       }
       
@@ -524,9 +715,10 @@ app.post('/api/admin/add-numbers', async (req, res) => {
       const numberRef = db.collection('numbers').doc();
       batch.set(numberRef, {
         number,
-        apiUrl,  // Store EXACTLY as provided, NO conversion
+        apiUrl,
         price: priceStr,
         status: 'available',
+        type: 'verification',
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
@@ -547,7 +739,7 @@ app.post('/api/admin/add-numbers', async (req, res) => {
     res.json({
       success: true,
       addedCount,
-      message: `${addedCount} numbers added successfully at PKR ${price}`
+      message: `${addedCount} verification numbers added successfully at PKR ${price}`
     });
     
   } catch (error) {
@@ -556,7 +748,80 @@ app.post('/api/admin/add-numbers', async (req, res) => {
   }
 });
 
-// Get numbers with pagination
+// ==================== ADD FB ID CREATION NUMBERS (NEW) ====================
+app.post('/api/admin/add-fb-numbers', async (req, res) => {
+  try {
+    const { numbersText, price } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    if (!numbersText || !price) {
+      return res.status(400).json({ error: 'Numbers text and price required' });
+    }
+    
+    const lines = numbersText.trim().split('\n');
+    const batch = db.batch();
+    let addedCount = 0;
+    
+    const priceStr = price.toString();
+    const fbPriceCountRef = db.collection('fbPriceCounts').doc(priceStr);
+    
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+      
+      let number, apiUrl;
+      
+      if (trimmedLine.includes('|')) {
+        const parts = trimmedLine.split('|');
+        number = parts[0].trim();
+        apiUrl = parts[1].trim();
+      } else {
+        continue;
+      }
+      
+      if (!number || !apiUrl) continue;
+      
+      const numberRef = db.collection('fbNumbers').doc();
+      batch.set(numberRef, {
+        number,
+        apiUrl,
+        price: priceStr,
+        status: 'available',
+        type: 'fb-creation',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      addedCount++;
+    }
+    
+    if (addedCount === 0) {
+      return res.status(400).json({ error: 'No valid FB numbers found. Use format: number|apiUrl' });
+    }
+    
+    batch.set(fbPriceCountRef, {
+      availableCount: admin.firestore.FieldValue.increment(addedCount),
+      soldCount: admin.firestore.FieldValue.increment(0)
+    }, { merge: true });
+    
+    await batch.commit();
+    
+    res.json({
+      success: true,
+      addedCount,
+      message: `${addedCount} FB ID Creation numbers added successfully at PKR ${price}`
+    });
+    
+  } catch (error) {
+    console.error('Add FB numbers error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get VERIFICATION numbers with pagination
 app.post('/api/admin/numbers', async (req, res) => {
   try {
     const { status, lastDocId } = req.body;
@@ -602,7 +867,53 @@ app.post('/api/admin/numbers', async (req, res) => {
   }
 });
 
-// Delete numbers
+// Get FB ID CREATION numbers with pagination (NEW)
+app.post('/api/admin/fb-numbers', async (req, res) => {
+  try {
+    const { status, lastDocId } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    let query = db.collection('fbNumbers').orderBy('createdAt', 'desc').limit(30);
+    
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+    
+    if (lastDocId) {
+      const lastDoc = await db.collection('fbNumbers').doc(lastDocId).get();
+      query = query.startAfter(lastDoc);
+    }
+    
+    const snapshot = await query.get();
+    
+    const numbers = [];
+    let lastId = null;
+    
+    snapshot.forEach(doc => {
+      numbers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+      lastId = doc.id;
+    });
+    
+    res.json({
+      numbers,
+      lastDocId: lastId,
+      hasMore: numbers.length === 30
+    });
+    
+  } catch (error) {
+    console.error('Get FB numbers error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete VERIFICATION numbers
 app.post('/api/admin/delete-numbers', async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -631,7 +942,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       
       return res.json({
         success: true,
-        message: `${deletedCount} sold numbers deleted`
+        message: `${deletedCount} sold verification numbers deleted`
       });
       
     } else if (numberIds && numberIds.length > 0) {
@@ -692,7 +1003,7 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
       
       return res.json({
         success: true,
-        message: `${results.totalDeleted} numbers deleted successfully`,
+        message: `${results.totalDeleted} verification numbers deleted successfully`,
         priceUpdates: results.priceUpdates
       });
       
@@ -702,6 +1013,110 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
     
   } catch (error) {
     console.error('Delete numbers error:', error);
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
+  }
+});
+
+// Delete FB ID CREATION numbers (NEW)
+app.post('/api/admin/delete-fb-numbers', async (req, res) => {
+  try {
+    const { numberIds, deleteAllSold } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    if (deleteAllSold) {
+      const soldSnapshot = await db.collection('fbNumbers')
+        .where('status', '==', 'sold')
+        .get();
+      
+      const batch = db.batch();
+      let deletedCount = 0;
+      
+      soldSnapshot.forEach(doc => {
+        batch.delete(doc.ref);
+        deletedCount++;
+      });
+      
+      if (deletedCount > 0) {
+        await batch.commit();
+      }
+      
+      return res.json({
+        success: true,
+        message: `${deletedCount} sold FB numbers deleted`
+      });
+      
+    } else if (numberIds && numberIds.length > 0) {
+      const BATCH_SIZE = 10;
+      const results = {
+        totalDeleted: 0,
+        priceUpdates: {}
+      };
+      
+      for (let i = 0; i < numberIds.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        const chunk = numberIds.slice(i, i + BATCH_SIZE);
+        const priceUpdatesInChunk = {};
+        
+        for (const id of chunk) {
+          const numberDoc = await db.collection('fbNumbers').doc(id).get();
+          
+          if (numberDoc.exists) {
+            const numberData = numberDoc.data();
+            
+            if (numberData.status === 'available') {
+              const price = numberData.price.toString();
+              priceUpdatesInChunk[price] = (priceUpdatesInChunk[price] || 0) + 1;
+            }
+            
+            batch.delete(numberDoc.ref);
+            results.totalDeleted++;
+          }
+        }
+        
+        for (const [price, count] of Object.entries(priceUpdatesInChunk)) {
+          const fbPriceCountRef = db.collection('fbPriceCounts').doc(price);
+          const fbPriceCountDoc = await fbPriceCountRef.get();
+          
+          if (fbPriceCountDoc.exists) {
+            const currentCount = fbPriceCountDoc.data().availableCount || 0;
+            if (currentCount >= count) {
+              batch.set(fbPriceCountRef, {
+                availableCount: admin.firestore.FieldValue.increment(-count)
+              }, { merge: true });
+              
+              results.priceUpdates[price] = (results.priceUpdates[price] || 0) + count;
+            } else {
+              batch.set(fbPriceCountRef, {
+                availableCount: 0
+              }, { merge: true });
+            }
+          } else {
+            batch.set(fbPriceCountRef, {
+              availableCount: 0,
+              soldCount: 0
+            });
+          }
+        }
+        
+        await batch.commit();
+      }
+      
+      return res.json({
+        success: true,
+        message: `${results.totalDeleted} FB numbers deleted successfully`,
+        priceUpdates: results.priceUpdates
+      });
+      
+    } else {
+      return res.status(400).json({ error: 'No FB numbers specified' });
+    }
+    
+  } catch (error) {
+    console.error('Delete FB numbers error:', error);
     res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
@@ -818,8 +1233,16 @@ app.post('/api/admin/delete-user', async (req, res) => {
     const purchasedSnapshot = await db.collection('users').doc(userId)
       .collection('purchased').get();
     
+    const fbPurchasedSnapshot = await db.collection('users').doc(userId)
+      .collection('fbPurchased').get();
+    
     const batch = db.batch();
+    
     purchasedSnapshot.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    
+    fbPurchasedSnapshot.forEach(doc => {
       batch.delete(doc.ref);
     });
     
@@ -869,14 +1292,21 @@ app.get('/', (req, res) => {
       '/api/auth/login',
       '/api/admin/login',
       '/api/user/dashboard',
+      '/api/user/fb-dashboard',
       '/api/user/buy-number',
+      '/api/user/buy-fb-number',
       '/api/user/my-numbers',
+      '/api/user/my-fb-numbers',
       '/api/user/delete-number',
+      '/api/user/delete-fb-number',
       '/api/proxy',
       '/api/admin/dashboard',
       '/api/admin/add-numbers',
+      '/api/admin/add-fb-numbers',
       '/api/admin/numbers',
+      '/api/admin/fb-numbers',
       '/api/admin/delete-numbers',
+      '/api/admin/delete-fb-numbers',
       '/api/admin/users',
       '/api/admin/update-user-balance',
       '/api/admin/delete-user'
