@@ -416,6 +416,40 @@ app.post('/api/user/delete-number', async (req, res) => {
   }
 });
 
+// Delete multiple user's purchased numbers (Normal Numbers)
+app.post('/api/user/delete-numbers', async (req, res) => {
+  try {
+    const { userId, numberIds } = req.body;
+    
+    if (!userId || !numberIds || !Array.isArray(numberIds) || numberIds.length === 0) {
+      return res.status(400).json({ error: 'UserId and numberIds array required' });
+    }
+    
+    const batch = db.batch();
+    
+    for (const numberId of numberIds) {
+      const userNumberRef = db.collection('users').doc(userId)
+        .collection('purchased').doc(numberId);
+      
+      batch.update(userNumberRef, {
+        status: 'deleted',
+        deletedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    await batch.commit();
+    
+    res.json({ 
+      success: true, 
+      message: `${numberIds.length} numbers deleted successfully` 
+    });
+    
+  } catch (error) {
+    console.error('Delete numbers error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ==================== USER ENDPOINTS (ID CREATION NUMBERS) ====================
 
 // Get user balance and ID price list
@@ -605,6 +639,40 @@ app.post('/api/user/delete-id-number', async (req, res) => {
     
   } catch (error) {
     console.error('Delete ID number error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete multiple user's purchased ID numbers
+app.post('/api/user/delete-id-numbers', async (req, res) => {
+  try {
+    const { userId, numberIds } = req.body;
+    
+    if (!userId || !numberIds || !Array.isArray(numberIds) || numberIds.length === 0) {
+      return res.status(400).json({ error: 'UserId and numberIds array required' });
+    }
+    
+    const batch = db.batch();
+    
+    for (const numberId of numberIds) {
+      const userNumberRef = db.collection('users').doc(userId)
+        .collection('purchased').doc(numberId);
+      
+      batch.update(userNumberRef, {
+        status: 'deleted',
+        deletedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    
+    await batch.commit();
+    
+    res.json({ 
+      success: true, 
+      message: `${numberIds.length} ID numbers deleted successfully` 
+    });
+    
+  } catch (error) {
+    console.error('Delete ID numbers error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1284,7 +1352,7 @@ app.get('/api/health', (req, res) => {
 // Version endpoint for cache busting
 app.get('/api/version', (req, res) => {
   res.json({ 
-    version: '2.0.0',
+    version: '4.0.0',
     timestamp: Date.now()
   });
 });
@@ -1303,10 +1371,12 @@ app.get('/', (req, res) => {
       '/api/user/buy-number',
       '/api/user/my-numbers',
       '/api/user/delete-number',
+      '/api/user/delete-numbers',
       '/api/user/id-dashboard',
       '/api/user/buy-id-number',
       '/api/user/my-id-numbers',
       '/api/user/delete-id-number',
+      '/api/user/delete-id-numbers',
       '/api/proxy',
       '/api/admin/dashboard',
       '/api/admin/add-numbers',
