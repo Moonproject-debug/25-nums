@@ -4,7 +4,17 @@ const admin = require('firebase-admin');
 
 // Initialize Express
 const app = express();
-app.use(cors());
+
+// ✅ CORS - COMPLETE FIX
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'admin-token']
+}));
+
+// ✅ Handle preflight requests
+app.options('*', cors());
+
 app.use(express.json());
 
 // Initialize Firebase Admin with error handling
@@ -124,6 +134,13 @@ app.post('/api/auth/login', async (req, res) => {
       
       if (data.error.message === 'USER_DISABLED') {
         return res.status(400).json({ error: 'User account disabled' });
+      }
+      
+      if (data.error.message === 'QUOTA_EXCEEDED') {
+        return res.status(429).json({ 
+          error: 'Too many login attempts. Please wait 1 hour and try again.',
+          retryAfter: 3600
+        });
       }
       
       return res.status(400).json({ error: 'Login failed: ' + data.error.message });
