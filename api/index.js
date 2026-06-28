@@ -390,7 +390,7 @@ app.post('/api/user/buy-number', async (req, res) => {
   }
 });
 
-// Buy bulk numbers (Normal Numbers) - NEW
+// Buy bulk numbers (Normal Numbers) - FIXED BALANCE DEDUCTION
 app.post('/api/user/bulk-buy-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -426,9 +426,11 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       }
       
       const userData = userDoc.data();
+      const currentBalance = userData.balance || 0;
       
-      if (userData.balance < totalPrice) {
-        throw new Error(`Insufficient balance. Need ${totalPrice} PKR`);
+      // CHECK BALANCE
+      if (currentBalance < totalPrice) {
+        throw new Error(`Insufficient balance. Need ${totalPrice} PKR, you have ${currentBalance} PKR`);
       }
       
       // Find available numbers (any price, but we'll use them)
@@ -489,7 +491,7 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
         });
       }
       
-      // Deduct balance
+      // DEDUCT BALANCE - FIXED
       transaction.update(userRef, {
         balance: admin.firestore.FieldValue.increment(-totalPrice)
       });
@@ -497,7 +499,8 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       return {
         purchasedNumbers,
         totalPrice,
-        quantity: purchasedNumbers.length
+        quantity: purchasedNumbers.length,
+        newBalance: currentBalance - totalPrice
       };
     });
     
@@ -506,7 +509,8 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       message: `${result.quantity} numbers purchased successfully for ${result.totalPrice} PKR`,
       numbers: result.purchasedNumbers,
       quantity: result.quantity,
-      totalPrice: result.totalPrice
+      totalPrice: result.totalPrice,
+      newBalance: result.newBalance
     });
     
   } catch (error) {
@@ -756,7 +760,7 @@ app.post('/api/user/buy-id-number', async (req, res) => {
   }
 });
 
-// Buy bulk ID numbers - NEW
+// Buy bulk ID numbers - FIXED BALANCE DEDUCTION
 app.post('/api/user/bulk-buy-id-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -792,9 +796,11 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       }
       
       const userData = userDoc.data();
+      const currentBalance = userData.balance || 0;
       
-      if (userData.balance < totalPrice) {
-        throw new Error(`Insufficient balance. Need ${totalPrice} PKR`);
+      // CHECK BALANCE
+      if (currentBalance < totalPrice) {
+        throw new Error(`Insufficient balance. Need ${totalPrice} PKR, you have ${currentBalance} PKR`);
       }
       
       // Find available ID numbers
@@ -855,7 +861,7 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
         });
       }
       
-      // Deduct balance
+      // DEDUCT BALANCE - FIXED
       transaction.update(userRef, {
         balance: admin.firestore.FieldValue.increment(-totalPrice)
       });
@@ -863,7 +869,8 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       return {
         purchasedNumbers,
         totalPrice,
-        quantity: purchasedNumbers.length
+        quantity: purchasedNumbers.length,
+        newBalance: currentBalance - totalPrice
       };
     });
     
@@ -872,7 +879,8 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       message: `${result.quantity} ID numbers purchased successfully for ${result.totalPrice} PKR`,
       numbers: result.purchasedNumbers,
       quantity: result.quantity,
-      totalPrice: result.totalPrice
+      totalPrice: result.totalPrice,
+      newBalance: result.newBalance
     });
     
   } catch (error) {
@@ -1502,7 +1510,7 @@ app.post('/api/admin/delete-id-numbers', async (req, res) => {
 
 // ==================== ADMIN BULK PRICES ENDPOINTS ====================
 
-// Set bulk prices - NEW
+// Set bulk prices
 app.post('/api/admin/set-bulk-prices', async (req, res) => {
   try {
     const { 
@@ -1535,10 +1543,10 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
     }
     
     const bulkPrices = {
-      normal_10: normal_10 !== null && normal_10 !== undefined ? parseInt(normal_10) : null,
-      normal_20: normal_20 !== null && normal_20 !== undefined ? parseInt(normal_20) : null,
-      id_10: id_10 !== null && id_10 !== undefined ? parseInt(id_10) : null,
-      id_20: id_20 !== null && id_20 !== undefined ? parseInt(id_20) : null,
+      normal_10: normal_10 !== null && normal_10 !== undefined && normal_10 !== '' ? parseInt(normal_10) : null,
+      normal_20: normal_20 !== null && normal_20 !== undefined && normal_20 !== '' ? parseInt(normal_20) : null,
+      id_10: id_10 !== null && id_10 !== undefined && id_10 !== '' ? parseInt(id_10) : null,
+      id_20: id_20 !== null && id_20 !== undefined && id_20 !== '' ? parseInt(id_20) : null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: 'admin'
     };
@@ -1557,7 +1565,7 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
   }
 });
 
-// Get bulk prices - NEW
+// Get bulk prices
 app.post('/api/admin/get-bulk-prices', async (req, res) => {
   try {
     const adminToken = req.headers['admin-token'];
