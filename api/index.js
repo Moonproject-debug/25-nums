@@ -242,7 +242,7 @@ app.post('/api/admin/login', async (req, res) => {
 
 // ==================== USER ENDPOINTS (NORMAL NUMBERS) ====================
 
-// Get user balance and price list (Normal Numbers)
+// Get user balance, price list, and bulk prices (Normal Numbers)
 app.post('/api/user/dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -274,10 +274,24 @@ app.post('/api/user/dashboard', async (req, res) => {
     
     priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
+    // Get bulk prices
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    let bulkPrices = {
+      normal_10: null,
+      normal_20: null,
+      id_10: null,
+      id_20: null
+    };
+    
+    if (bulkPricesDoc.exists) {
+      bulkPrices = bulkPricesDoc.data();
+    }
+    
     res.json({
       balance: userData.balance || 0,
       email: userData.email,
-      priceList
+      priceList,
+      bulkPrices
     });
     
   } catch (error) {
@@ -286,7 +300,7 @@ app.post('/api/user/dashboard', async (req, res) => {
   }
 });
 
-// Buy number (Normal Numbers)
+// Buy single number (Normal Numbers)
 app.post('/api/user/buy-number', async (req, res) => {
   try {
     const { userId, price } = req.body;
@@ -372,6 +386,131 @@ app.post('/api/user/buy-number', async (req, res) => {
     
   } catch (error) {
     console.error('Buy number error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Buy bulk numbers (Normal Numbers) - NEW
+app.post('/api/user/bulk-buy-number', async (req, res) => {
+  try {
+    const { userId, quantity } = req.body;
+    
+    if (!userId || !quantity) {
+      return res.status(400).json({ error: 'UserId and quantity required' });
+    }
+    
+    if (![10, 20].includes(quantity)) {
+      return res.status(400).json({ error: 'Quantity must be 10 or 20' });
+    }
+    
+    // Get bulk price
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    if (!bulkPricesDoc.exists) {
+      return res.status(400).json({ error: 'Bulk prices not set by admin' });
+    }
+    
+    const bulkPrices = bulkPricesDoc.data();
+    const priceKey = `normal_${quantity}`;
+    const totalPrice = bulkPrices[priceKey];
+    
+    if (!totalPrice || totalPrice <= 0) {
+      return res.status(400).json({ error: `Bulk price for ${quantity} numbers not set` });
+    }
+    
+    const result = await db.runTransaction(async (transaction) => {
+      const userRef = db.collection('users').doc(userId);
+      const userDoc = await transaction.get(userRef);
+      
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+      
+      const userData = userDoc.data();
+      
+      if (userData.balance < totalPrice) {
+        throw new Error(`Insufficient balance. Need ${totalPrice} PKR`);
+      }
+      
+      // Find available numbers (any price, but we'll use them)
+      const numbersQuery = await db.collection('numbers')
+        .where('status', '==', 'available')
+        .limit(quantity)
+        .get();
+      
+      if (numbersQuery.size < quantity) {
+        throw new Error(`Only ${numbersQuery.size} numbers available. Need ${quantity}`);
+      }
+      
+      const purchasedNumbers = [];
+      const priceUpdates = {};
+      
+      // Process each number
+      for (const doc of numbersQuery.docs) {
+        const numberData = doc.data();
+        const price = numberData.price;
+        
+        // Update number status
+        transaction.update(doc.ref, {
+          status: 'sold',
+          soldTo: userId,
+          soldAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        // Track price updates
+        priceUpdates[price] = (priceUpdates[price] || 0) + 1;
+        
+        // Add to user's purchased collection
+        const userNumberRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
+        transaction.set(userNumberRef, {
+          number: numberData.number,
+          apiUrl: numberData.apiUrl,
+          price: price,
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'active',
+          type: 'normal',
+          bulkPurchase: true,
+          bulkQuantity: quantity
+        });
+        
+        purchasedNumbers.push({
+          id: doc.id,
+          number: numberData.number,
+          apiUrl: numberData.apiUrl,
+          price: price
+        });
+      }
+      
+      // Update price counts
+      for (const [price, count] of Object.entries(priceUpdates)) {
+        const priceCountRef = db.collection('priceCounts').doc(price);
+        transaction.update(priceCountRef, {
+          availableCount: admin.firestore.FieldValue.increment(-count),
+          soldCount: admin.firestore.FieldValue.increment(count)
+        });
+      }
+      
+      // Deduct balance
+      transaction.update(userRef, {
+        balance: admin.firestore.FieldValue.increment(-totalPrice)
+      });
+      
+      return {
+        purchasedNumbers,
+        totalPrice,
+        quantity: purchasedNumbers.length
+      };
+    });
+    
+    res.json({
+      success: true,
+      message: `${result.quantity} numbers purchased successfully for ${result.totalPrice} PKR`,
+      numbers: result.purchasedNumbers,
+      quantity: result.quantity,
+      totalPrice: result.totalPrice
+    });
+    
+  } catch (error) {
+    console.error('Bulk buy number error:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -469,7 +608,7 @@ app.post('/api/user/delete-numbers', async (req, res) => {
 
 // ==================== USER ENDPOINTS (ID CREATION NUMBERS) ====================
 
-// Get user balance and ID price list
+// Get user balance and ID price list (with bulk prices)
 app.post('/api/user/id-dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -501,10 +640,24 @@ app.post('/api/user/id-dashboard', async (req, res) => {
     
     priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
+    // Get bulk prices
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    let bulkPrices = {
+      normal_10: null,
+      normal_20: null,
+      id_10: null,
+      id_20: null
+    };
+    
+    if (bulkPricesDoc.exists) {
+      bulkPrices = bulkPricesDoc.data();
+    }
+    
     res.json({
       balance: userData.balance || 0,
       email: userData.email,
-      priceList
+      priceList,
+      bulkPrices
     });
     
   } catch (error) {
@@ -513,7 +666,7 @@ app.post('/api/user/id-dashboard', async (req, res) => {
   }
 });
 
-// Buy ID number
+// Buy single ID number
 app.post('/api/user/buy-id-number', async (req, res) => {
   try {
     const { userId, price } = req.body;
@@ -599,6 +752,131 @@ app.post('/api/user/buy-id-number', async (req, res) => {
     
   } catch (error) {
     console.error('Buy ID number error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Buy bulk ID numbers - NEW
+app.post('/api/user/bulk-buy-id-number', async (req, res) => {
+  try {
+    const { userId, quantity } = req.body;
+    
+    if (!userId || !quantity) {
+      return res.status(400).json({ error: 'UserId and quantity required' });
+    }
+    
+    if (![10, 20].includes(quantity)) {
+      return res.status(400).json({ error: 'Quantity must be 10 or 20' });
+    }
+    
+    // Get bulk price
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    if (!bulkPricesDoc.exists) {
+      return res.status(400).json({ error: 'Bulk prices not set by admin' });
+    }
+    
+    const bulkPrices = bulkPricesDoc.data();
+    const priceKey = `id_${quantity}`;
+    const totalPrice = bulkPrices[priceKey];
+    
+    if (!totalPrice || totalPrice <= 0) {
+      return res.status(400).json({ error: `Bulk price for ${quantity} ID numbers not set` });
+    }
+    
+    const result = await db.runTransaction(async (transaction) => {
+      const userRef = db.collection('users').doc(userId);
+      const userDoc = await transaction.get(userRef);
+      
+      if (!userDoc.exists) {
+        throw new Error('User not found');
+      }
+      
+      const userData = userDoc.data();
+      
+      if (userData.balance < totalPrice) {
+        throw new Error(`Insufficient balance. Need ${totalPrice} PKR`);
+      }
+      
+      // Find available ID numbers
+      const numbersQuery = await db.collection('idNumbers')
+        .where('status', '==', 'available')
+        .limit(quantity)
+        .get();
+      
+      if (numbersQuery.size < quantity) {
+        throw new Error(`Only ${numbersQuery.size} ID numbers available. Need ${quantity}`);
+      }
+      
+      const purchasedNumbers = [];
+      const priceUpdates = {};
+      
+      // Process each number
+      for (const doc of numbersQuery.docs) {
+        const numberData = doc.data();
+        const price = numberData.price;
+        
+        // Update number status
+        transaction.update(doc.ref, {
+          status: 'sold',
+          soldTo: userId,
+          soldAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        // Track price updates
+        priceUpdates[price] = (priceUpdates[price] || 0) + 1;
+        
+        // Add to user's purchased collection
+        const userNumberRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
+        transaction.set(userNumberRef, {
+          number: numberData.number,
+          apiUrl: numberData.apiUrl,
+          price: price,
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'active',
+          type: 'id',
+          bulkPurchase: true,
+          bulkQuantity: quantity
+        });
+        
+        purchasedNumbers.push({
+          id: doc.id,
+          number: numberData.number,
+          apiUrl: numberData.apiUrl,
+          price: price
+        });
+      }
+      
+      // Update price counts
+      for (const [price, count] of Object.entries(priceUpdates)) {
+        const priceCountRef = db.collection('idPriceCounts').doc(price);
+        transaction.update(priceCountRef, {
+          availableCount: admin.firestore.FieldValue.increment(-count),
+          soldCount: admin.firestore.FieldValue.increment(count)
+        });
+      }
+      
+      // Deduct balance
+      transaction.update(userRef, {
+        balance: admin.firestore.FieldValue.increment(-totalPrice)
+      });
+      
+      return {
+        purchasedNumbers,
+        totalPrice,
+        quantity: purchasedNumbers.length
+      };
+    });
+    
+    res.json({
+      success: true,
+      message: `${result.quantity} ID numbers purchased successfully for ${result.totalPrice} PKR`,
+      numbers: result.purchasedNumbers,
+      quantity: result.quantity,
+      totalPrice: result.totalPrice
+    });
+    
+  } catch (error) {
+    console.error('Bulk buy ID number error:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -1222,10 +1500,65 @@ app.post('/api/admin/delete-id-numbers', async (req, res) => {
   }
 });
 
-// ==================== BULK PRICE MANAGEMENT (ADMIN) ====================
+// ==================== ADMIN BULK PRICES ENDPOINTS ====================
 
-// Get all bulk prices (Normal + ID)
-app.post('/api/admin/bulk-prices', async (req, res) => {
+// Set bulk prices - NEW
+app.post('/api/admin/set-bulk-prices', async (req, res) => {
+  try {
+    const { 
+      normal_10, 
+      normal_20, 
+      id_10, 
+      id_20 
+    } = req.body;
+    
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    // Validate prices
+    const prices = [
+      { key: 'normal_10', value: normal_10 },
+      { key: 'normal_20', value: normal_20 },
+      { key: 'id_10', value: id_10 },
+      { key: 'id_20', value: id_20 }
+    ];
+    
+    for (const p of prices) {
+      if (p.value !== null && p.value !== undefined) {
+        if (isNaN(p.value) || parseInt(p.value) < 0) {
+          return res.status(400).json({ error: `Invalid price for ${p.key}` });
+        }
+      }
+    }
+    
+    const bulkPrices = {
+      normal_10: normal_10 !== null && normal_10 !== undefined ? parseInt(normal_10) : null,
+      normal_20: normal_20 !== null && normal_20 !== undefined ? parseInt(normal_20) : null,
+      id_10: id_10 !== null && id_10 !== undefined ? parseInt(id_10) : null,
+      id_20: id_20 !== null && id_20 !== undefined ? parseInt(id_20) : null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: 'admin'
+    };
+    
+    await db.collection('settings').doc('bulkPrices').set(bulkPrices, { merge: true });
+    
+    res.json({
+      success: true,
+      message: 'Bulk prices updated successfully',
+      bulkPrices
+    });
+    
+  } catch (error) {
+    console.error('Set bulk prices error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get bulk prices - NEW
+app.post('/api/admin/get-bulk-prices', async (req, res) => {
   try {
     const adminToken = req.headers['admin-token'];
     
@@ -1233,310 +1566,28 @@ app.post('/api/admin/bulk-prices', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Get Normal Bulk Prices
-    const normalSnapshot = await db.collection('bulkPriceCounts').get();
-    const normalPrices = [];
-    normalSnapshot.forEach(doc => {
-      const data = doc.data();
-      normalPrices.push({
-        id: doc.id,
-        quantity: data.quantity || 0,
-        price: data.price || 0,
-        type: data.type || 'normal',
-        availableCount: data.availableCount || 0,
-        soldCount: data.soldCount || 0,
-        createdAt: data.createdAt
-      });
-    });
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
     
-    // Get ID Bulk Prices
-    const idSnapshot = await db.collection('idBulkPriceCounts').get();
-    const idPrices = [];
-    idSnapshot.forEach(doc => {
-      const data = doc.data();
-      idPrices.push({
-        id: doc.id,
-        quantity: data.quantity || 0,
-        price: data.price || 0,
-        type: data.type || 'id',
-        availableCount: data.availableCount || 0,
-        soldCount: data.soldCount || 0,
-        createdAt: data.createdAt
+    if (!bulkPricesDoc.exists) {
+      return res.json({
+        success: true,
+        bulkPrices: {
+          normal_10: null,
+          normal_20: null,
+          id_10: null,
+          id_20: null
+        }
       });
-    });
+    }
     
     res.json({
-      normalPrices,
-      idPrices
+      success: true,
+      bulkPrices: bulkPricesDoc.data()
     });
     
   } catch (error) {
     console.error('Get bulk prices error:', error);
     res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Add or update bulk price (Normal Numbers)
-app.post('/api/admin/add-bulk-price', async (req, res) => {
-  try {
-    const { quantity, price, type } = req.body;
-    const adminToken = req.headers['admin-token'];
-    
-    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    
-    if (!quantity || !price || !type) {
-      return res.status(400).json({ error: 'Quantity, price and type required' });
-    }
-    
-    if (quantity < 2) {
-      return res.status(400).json({ error: 'Quantity must be at least 2 for bulk' });
-    }
-    
-    if (price <= 0) {
-      return res.status(400).json({ error: 'Price must be greater than 0' });
-    }
-    
-    const collectionName = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
-    const docId = `${quantity}_${price}`;
-    
-    const ref = db.collection(collectionName).doc(docId);
-    const doc = await ref.get();
-    
-    if (doc.exists) {
-      // Update existing
-      await ref.update({
-        quantity: parseInt(quantity),
-        price: parseInt(price),
-        type: type,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    } else {
-      // Create new
-      await ref.set({
-        quantity: parseInt(quantity),
-        price: parseInt(price),
-        type: type,
-        availableCount: 0,
-        soldCount: 0,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: `Bulk price ${quantity} numbers for PKR ${price} added successfully`
-    });
-    
-  } catch (error) {
-    console.error('Add bulk price error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete bulk price (Normal Numbers)
-app.post('/api/admin/delete-bulk-price', async (req, res) => {
-  try {
-    const { priceId, type } = req.body;
-    const adminToken = req.headers['admin-token'];
-    
-    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    
-    if (!priceId || !type) {
-      return res.status(400).json({ error: 'Price ID and type required' });
-    }
-    
-    const collectionName = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
-    await db.collection(collectionName).doc(priceId).delete();
-    
-    res.json({
-      success: true,
-      message: 'Bulk price deleted successfully'
-    });
-    
-  } catch (error) {
-    console.error('Delete bulk price error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ==================== USER BULK BUY ENDPOINTS ====================
-
-// Get bulk prices for user (Normal + ID)
-app.post('/api/user/bulk-prices', async (req, res) => {
-  try {
-    const { userId, type } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'UserId required' });
-    }
-    
-    const collectionName = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
-    const snapshot = await db.collection(collectionName).get();
-    
-    const bulkPrices = [];
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      if (data.availableCount > 0) {
-        bulkPrices.push({
-          id: doc.id,
-          quantity: data.quantity || 0,
-          price: data.price || 0,
-          availableCount: data.availableCount || 0,
-          type: data.type || type || 'normal'
-        });
-      }
-    });
-    
-    bulkPrices.sort((a, b) => parseInt(a.price) - parseInt(b.price));
-    
-    res.json({ bulkPrices });
-    
-  } catch (error) {
-    console.error('Get bulk prices error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ============================================================
-// ✅ UPDATED: Buy bulk numbers (Works with ANY price numbers)
-// ============================================================
-app.post('/api/user/buy-bulk', async (req, res) => {
-  try {
-    const { userId, quantity, price, type } = req.body;
-    
-    if (!userId || !quantity || !price) {
-      return res.status(400).json({ error: 'UserId, quantity and price required' });
-    }
-    
-    const qty = parseInt(quantity);
-    const bulkPrice = parseInt(price);
-    
-    if (qty < 2) {
-      return res.status(400).json({ error: 'Quantity must be at least 2 for bulk purchase' });
-    }
-    
-    const collectionName = type === 'id' ? 'idNumbers' : 'numbers';
-    const purchasedType = type === 'id' ? 'id' : 'normal';
-    
-    const result = await db.runTransaction(async (transaction) => {
-      const userRef = db.collection('users').doc(userId);
-      const userDoc = await transaction.get(userRef);
-      
-      if (!userDoc.exists) {
-        throw new Error('User not found');
-      }
-      
-      const userData = userDoc.data();
-      
-      if (userData.balance < bulkPrice) {
-        throw new Error('Insufficient balance');
-      }
-      
-      // ✅ NEW: Get ALL available numbers, ANY price (cheapest first)
-      const numbersQuery = await db.collection(collectionName)
-        .where('status', '==', 'available')
-        .orderBy('price', 'asc')
-        .limit(qty)
-        .get();
-      
-      if (numbersQuery.empty || numbersQuery.size < qty) {
-        throw new Error(`Not enough numbers available. Only ${numbersQuery.size} available, need ${qty}`);
-      }
-      
-      const purchasedNumbers = [];
-      const batch = db.batch();
-      const priceUpdates = {};
-      
-      // Process each number
-      numbersQuery.docs.forEach(doc => {
-        const numberData = doc.data();
-        const priceStr = numberData.price.toString();
-        
-        // Track price updates for each price
-        priceUpdates[priceStr] = (priceUpdates[priceStr] || 0) + 1;
-        
-        batch.update(doc.ref, {
-          status: 'sold',
-          soldTo: userId,
-          soldAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        
-        purchasedNumbers.push({
-          numberId: doc.id,
-          number: numberData.number,
-          apiUrl: numberData.apiUrl,
-          actualPrice: numberData.price
-        });
-      });
-      
-      // Update price counts for each price used
-      for (const [priceStr, count] of Object.entries(priceUpdates)) {
-        const priceCountRef = db.collection(type === 'id' ? 'idPriceCounts' : 'priceCounts').doc(priceStr);
-        batch.set(priceCountRef, {
-          availableCount: admin.firestore.FieldValue.increment(-count),
-          soldCount: admin.firestore.FieldValue.increment(count)
-        }, { merge: true });
-      }
-      
-      // Update bulk package count (decrement available)
-      const bulkCountCollection = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
-      const bulkPriceRef = db.collection(bulkCountCollection).doc(`${qty}_${bulkPrice}`);
-      const bulkPriceDoc = await transaction.get(bulkPriceRef);
-      
-      if (bulkPriceDoc.exists && bulkPriceDoc.data().availableCount > 0) {
-        batch.set(bulkPriceRef, {
-          availableCount: admin.firestore.FieldValue.increment(-1),
-          soldCount: admin.firestore.FieldValue.increment(1)
-        }, { merge: true });
-      } else {
-        throw new Error('Bulk package not available');
-      }
-      
-      // Update user balance
-      batch.update(userRef, {
-        balance: admin.firestore.FieldValue.increment(-bulkPrice)
-      });
-      
-      // Add to user's purchased collection
-      purchasedNumbers.forEach((purchased) => {
-        const userNumberRef = db.collection('users').doc(userId)
-          .collection('purchased').doc(purchased.numberId);
-        
-        batch.set(userNumberRef, {
-          number: purchased.number,
-          apiUrl: purchased.apiUrl,
-          price: purchased.actualPrice,
-          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-          status: 'active',
-          type: purchasedType,
-          bulkPurchase: true,
-          bulkQuantity: qty,
-          bulkPrice: bulkPrice
-        });
-      });
-      
-      await batch.commit();
-      
-      return {
-        purchasedCount: purchasedNumbers.length,
-        numbers: purchasedNumbers
-      };
-    });
-    
-    res.json({
-      success: true,
-      purchasedCount: result.purchasedCount,
-      numbers: result.numbers,
-      message: `${result.purchasedCount} numbers purchased successfully`
-    });
-    
-  } catch (error) {
-    console.error('Buy bulk error:', error);
-    res.status(400).json({ error: error.message });
   }
 });
 
@@ -1706,16 +1757,16 @@ app.get('/', (req, res) => {
       '/api/admin/login',
       '/api/user/dashboard',
       '/api/user/buy-number',
+      '/api/user/bulk-buy-number',
       '/api/user/my-numbers',
       '/api/user/delete-number',
       '/api/user/delete-numbers',
       '/api/user/id-dashboard',
       '/api/user/buy-id-number',
+      '/api/user/bulk-buy-id-number',
       '/api/user/my-id-numbers',
       '/api/user/delete-id-number',
       '/api/user/delete-id-numbers',
-      '/api/user/bulk-prices',
-      '/api/user/buy-bulk',
       '/api/proxy',
       '/api/admin/dashboard',
       '/api/admin/add-numbers',
@@ -1724,9 +1775,8 @@ app.get('/', (req, res) => {
       '/api/admin/add-id-numbers',
       '/api/admin/id-numbers',
       '/api/admin/delete-id-numbers',
-      '/api/admin/bulk-prices',
-      '/api/admin/add-bulk-price',
-      '/api/admin/delete-bulk-price',
+      '/api/admin/set-bulk-prices',
+      '/api/admin/get-bulk-prices',
       '/api/admin/users',
       '/api/admin/update-user-balance',
       '/api/admin/delete-user'
