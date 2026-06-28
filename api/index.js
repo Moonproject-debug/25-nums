@@ -1401,7 +1401,9 @@ app.post('/api/user/bulk-prices', async (req, res) => {
   }
 });
 
-// Buy bulk numbers (Normal Numbers)
+// ============================================================
+// ✅ UPDATED: Buy bulk numbers (Works with ANY price numbers)
+// ============================================================
 app.post('/api/user/buy-bulk', async (req, res) => {
   try {
     const { userId, quantity, price, type } = req.body;
@@ -1410,16 +1412,14 @@ app.post('/api/user/buy-bulk', async (req, res) => {
       return res.status(400).json({ error: 'UserId, quantity and price required' });
     }
     
-    const priceStr = price.toString();
     const qty = parseInt(quantity);
+    const bulkPrice = parseInt(price);
     
     if (qty < 2) {
       return res.status(400).json({ error: 'Quantity must be at least 2 for bulk purchase' });
     }
     
     const collectionName = type === 'id' ? 'idNumbers' : 'numbers';
-    const priceCountCollection = type === 'id' ? 'idPriceCounts' : 'priceCounts';
-    const bulkCountCollection = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
     const purchasedType = type === 'id' ? 'id' : 'normal';
     
     const result = await db.runTransaction(async (transaction) => {
@@ -1431,24 +1431,15 @@ app.post('/api/user/buy-bulk', async (req, res) => {
       }
       
       const userData = userDoc.data();
-      const totalCost = parseInt(priceStr);
       
-      if (userData.balance < totalCost) {
+      if (userData.balance < bulkPrice) {
         throw new Error('Insufficient balance');
       }
       
-      // Check bulk price exists and has enough available
-      const bulkPriceRef = db.collection(bulkCountCollection).doc(`${qty}_${priceStr}`);
-      const bulkPriceDoc = await transaction.get(bulkPriceRef);
-      
-      if (!bulkPriceDoc.exists || bulkPriceDoc.data().availableCount === 0) {
-        throw new Error('Bulk package not available');
-      }
-      
-      // Get available numbers for this price
+      // ✅ NEW: Get ALL available numbers, ANY price (cheapest first)
       const numbersQuery = await db.collection(collectionName)
-        .where('price', '==', priceStr)
         .where('status', '==', 'available')
+        .orderBy('price', 'asc')
         .limit(qty)
         .get();
       
@@ -1458,10 +1449,16 @@ app.post('/api/user/buy-bulk', async (req, res) => {
       
       const purchasedNumbers = [];
       const batch = db.batch();
+      const priceUpdates = {};
       
-      // Update each number
+      // Process each number
       numbersQuery.docs.forEach(doc => {
         const numberData = doc.data();
+        const priceStr = numberData.price.toString();
+        
+        // Track price updates for each price
+        priceUpdates[priceStr] = (priceUpdates[priceStr] || 0) + 1;
+        
         batch.update(doc.ref, {
           status: 'sold',
           soldTo: userId,
@@ -1471,26 +1468,37 @@ app.post('/api/user/buy-bulk', async (req, res) => {
         purchasedNumbers.push({
           numberId: doc.id,
           number: numberData.number,
-          apiUrl: numberData.apiUrl
+          apiUrl: numberData.apiUrl,
+          actualPrice: numberData.price
         });
       });
       
-      // Update price counts (decrement available, increment sold)
-      const priceCountRef = db.collection(priceCountCollection).doc(priceStr);
-      batch.set(priceCountRef, {
-        availableCount: admin.firestore.FieldValue.increment(-qty),
-        soldCount: admin.firestore.FieldValue.increment(qty)
-      }, { merge: true });
+      // Update price counts for each price used
+      for (const [priceStr, count] of Object.entries(priceUpdates)) {
+        const priceCountRef = db.collection(type === 'id' ? 'idPriceCounts' : 'priceCounts').doc(priceStr);
+        batch.set(priceCountRef, {
+          availableCount: admin.firestore.FieldValue.increment(-count),
+          soldCount: admin.firestore.FieldValue.increment(count)
+        }, { merge: true });
+      }
       
-      // Update bulk package count
-      batch.set(bulkPriceRef, {
-        availableCount: admin.firestore.FieldValue.increment(-1),
-        soldCount: admin.firestore.FieldValue.increment(1)
-      }, { merge: true });
+      // Update bulk package count (decrement available)
+      const bulkCountCollection = type === 'id' ? 'idBulkPriceCounts' : 'bulkPriceCounts';
+      const bulkPriceRef = db.collection(bulkCountCollection).doc(`${qty}_${bulkPrice}`);
+      const bulkPriceDoc = await transaction.get(bulkPriceRef);
+      
+      if (bulkPriceDoc.exists && bulkPriceDoc.data().availableCount > 0) {
+        batch.set(bulkPriceRef, {
+          availableCount: admin.firestore.FieldValue.increment(-1),
+          soldCount: admin.firestore.FieldValue.increment(1)
+        }, { merge: true });
+      } else {
+        throw new Error('Bulk package not available');
+      }
       
       // Update user balance
       batch.update(userRef, {
-        balance: admin.firestore.FieldValue.increment(-totalCost)
+        balance: admin.firestore.FieldValue.increment(-bulkPrice)
       });
       
       // Add to user's purchased collection
@@ -1501,12 +1509,13 @@ app.post('/api/user/buy-bulk', async (req, res) => {
         batch.set(userNumberRef, {
           number: purchased.number,
           apiUrl: purchased.apiUrl,
-          price: priceStr,
+          price: purchased.actualPrice,
           purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
           status: 'active',
           type: purchasedType,
           bulkPurchase: true,
-          bulkQuantity: qty
+          bulkQuantity: qty,
+          bulkPrice: bulkPrice
         });
       });
       
