@@ -1,3 +1,4 @@
+// index.js - USA Nums by Moon API (Complete)
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -1062,6 +1063,79 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
+// ==================== ADMIN REVENUE STATS (NEW) ====================
+
+// Get revenue stats - Total balance in user accounts + Total revenue from sold numbers
+app.post('/api/admin/revenue-stats', async (req, res) => {
+  try {
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    // Get all users to sum their balances
+    const usersSnapshot = await db.collection('users').get();
+    let totalUserBalance = 0;
+    let totalUsers = 0;
+    
+    usersSnapshot.forEach(doc => {
+      const userData = doc.data();
+      totalUserBalance += (userData.balance || 0);
+      totalUsers++;
+    });
+    
+    // Get all sold numbers (normal + ID) to calculate revenue
+    let totalRevenueNormal = 0;
+    let totalRevenueId = 0;
+    let totalSoldNormal = 0;
+    let totalSoldId = 0;
+    
+    // Get sold normal numbers
+    const soldNormalSnapshot = await db.collection('numbers')
+      .where('status', '==', 'sold')
+      .get();
+    
+    soldNormalSnapshot.forEach(doc => {
+      const data = doc.data();
+      totalRevenueNormal += parseInt(data.price) || 0;
+      totalSoldNormal++;
+    });
+    
+    // Get sold ID numbers
+    const soldIdSnapshot = await db.collection('idNumbers')
+      .where('status', '==', 'sold')
+      .get();
+    
+    soldIdSnapshot.forEach(doc => {
+      const data = doc.data();
+      totalRevenueId += parseInt(data.price) || 0;
+      totalSoldId++;
+    });
+    
+    const totalRevenue = totalRevenueNormal + totalRevenueId;
+    const totalSoldNumbers = totalSoldNormal + totalSoldId;
+    
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: totalUsers,
+        totalUserBalance: totalUserBalance, // Total balance in all user accounts
+        totalRevenueNormal: totalRevenueNormal, // Revenue from normal numbers
+        totalRevenueId: totalRevenueId, // Revenue from ID numbers
+        totalRevenue: totalRevenue, // Total revenue (normal + ID)
+        totalSoldNormal: totalSoldNormal, // Count of sold normal numbers
+        totalSoldId: totalSoldId, // Count of sold ID numbers
+        totalSoldNumbers: totalSoldNumbers // Total sold numbers
+      }
+    });
+    
+  } catch (error) {
+    console.error('Revenue stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Add numbers (Normal Numbers)
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
@@ -1777,6 +1851,7 @@ app.get('/', (req, res) => {
       '/api/user/delete-id-numbers',
       '/api/proxy',
       '/api/admin/dashboard',
+      '/api/admin/revenue-stats',
       '/api/admin/add-numbers',
       '/api/admin/numbers',
       '/api/admin/delete-numbers',
