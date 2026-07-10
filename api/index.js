@@ -344,7 +344,9 @@ app.post('/api/user/dashboard', async (req, res) => {
       normal_10: null,
       normal_20: null,
       id_10: null,
-      id_20: null
+      id_20: null,
+      id_50: null,
+      id_100: null
     };
     
     if (bulkPricesDoc.exists) {
@@ -857,7 +859,7 @@ app.post('/api/user/buy-number', async (req, res) => {
   }
 });
 
-// Buy bulk numbers (Normal Numbers)
+// Buy bulk numbers (Normal Numbers) - 10 & 20 only
 app.post('/api/user/bulk-buy-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -1108,7 +1110,9 @@ app.post('/api/user/id-dashboard', async (req, res) => {
       normal_10: null,
       normal_20: null,
       id_10: null,
-      id_20: null
+      id_20: null,
+      id_50: null,
+      id_100: null
     };
     
     if (bulkPricesDoc.exists) {
@@ -1218,7 +1222,7 @@ app.post('/api/user/buy-id-number', async (req, res) => {
   }
 });
 
-// Buy bulk ID numbers
+// Buy bulk ID numbers - 10, 20, 50, 100
 app.post('/api/user/bulk-buy-id-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -1227,8 +1231,8 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       return res.status(400).json({ error: 'UserId and quantity required' });
     }
     
-    if (![10, 20].includes(quantity)) {
-      return res.status(400).json({ error: 'Quantity must be 10 or 20' });
+    if (![10, 20, 50, 100].includes(quantity)) {
+      return res.status(400).json({ error: 'Quantity must be 10, 20, 50, or 100' });
     }
     
     const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
@@ -1652,7 +1656,7 @@ app.post('/api/admin/add-numbers', async (req, res) => {
   }
 });
 
-// Get numbers with pagination (Normal Numbers)
+// Get numbers with pagination (Normal Numbers) - 30 per page
 app.post('/api/admin/numbers', async (req, res) => {
   try {
     const { status, lastDocId } = req.body;
@@ -1876,17 +1880,20 @@ app.post('/api/admin/add-id-numbers', async (req, res) => {
   }
 });
 
-// Get ID numbers with pagination
+// Get ID numbers with pagination - 100 per page
 app.post('/api/admin/id-numbers', async (req, res) => {
   try {
-    const { status, lastDocId } = req.body;
+    const { status, lastDocId, limit } = req.body;
     const adminToken = req.headers['admin-token'];
     
     if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    let query = db.collection('idNumbers').orderBy('createdAt', 'desc').limit(30);
+    // Use 100 as default limit for ID numbers
+    const pageLimit = limit || 100;
+    
+    let query = db.collection('idNumbers').orderBy('createdAt', 'desc').limit(pageLimit);
     
     if (status && status !== 'all') {
       query = query.where('status', '==', status);
@@ -1913,7 +1920,7 @@ app.post('/api/admin/id-numbers', async (req, res) => {
     res.json({
       numbers,
       lastDocId: lastId,
-      hasMore: numbers.length === 30
+      hasMore: numbers.length === pageLimit
     });
     
   } catch (error) {
@@ -2035,7 +2042,9 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
       normal_10, 
       normal_20, 
       id_10, 
-      id_20 
+      id_20,
+      id_50,
+      id_100
     } = req.body;
     
     const adminToken = req.headers['admin-token'];
@@ -2048,7 +2057,9 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
       { key: 'normal_10', value: normal_10 },
       { key: 'normal_20', value: normal_20 },
       { key: 'id_10', value: id_10 },
-      { key: 'id_20', value: id_20 }
+      { key: 'id_20', value: id_20 },
+      { key: 'id_50', value: id_50 },
+      { key: 'id_100', value: id_100 }
     ];
     
     for (const p of prices) {
@@ -2064,6 +2075,8 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
       normal_20: normal_20 !== null && normal_20 !== undefined && normal_20 !== '' ? parseInt(normal_20) : null,
       id_10: id_10 !== null && id_10 !== undefined && id_10 !== '' ? parseInt(id_10) : null,
       id_20: id_20 !== null && id_20 !== undefined && id_20 !== '' ? parseInt(id_20) : null,
+      id_50: id_50 !== null && id_50 !== undefined && id_50 !== '' ? parseInt(id_50) : null,
+      id_100: id_100 !== null && id_100 !== undefined && id_100 !== '' ? parseInt(id_100) : null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: 'admin'
     };
@@ -2100,7 +2113,9 @@ app.post('/api/admin/get-bulk-prices', async (req, res) => {
           normal_10: null,
           normal_20: null,
           id_10: null,
-          id_20: null
+          id_20: null,
+          id_50: null,
+          id_100: null
         }
       });
     }
