@@ -105,12 +105,15 @@ app.post('/api/auth/signup', async (req, res) => {
             referredBy: referrerId
           });
           
+          // FIX: Use string timestamp instead of serverTimestamp() in array
+          const now = new Date().toISOString();
+          
           // Add user to referrer's referredUsers list
           await db.collection('referrals').doc(refCodeTrim).update({
             referredUsers: admin.firestore.FieldValue.arrayUnion({
               userId: userId,
               email: email.toLowerCase().trim(),
-              joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+              joinedAt: now,
               firstDepositDone: false,
               commissionPaid: false
             })
