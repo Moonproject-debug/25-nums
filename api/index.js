@@ -439,9 +439,22 @@ app.post('/api/user/transfer-history', async (req, res) => {
     
     const transfers = [];
     transfersSnapshot.forEach(doc => {
+      const data = doc.data();
+      // Convert timestamp to readable format
+      let timestamp = data.timestamp;
+      if (timestamp && timestamp.toDate) {
+        timestamp = timestamp.toDate().toISOString();
+      }
       transfers.push({
         id: doc.id,
-        ...doc.data()
+        type: data.type || 'unknown',
+        recipientEmail: data.recipientEmail || '',
+        senderEmail: data.senderEmail || '',
+        amount: data.amount || 0,
+        balanceAfter: data.balanceAfter || 0,
+        timestamp: timestamp,
+        date: timestamp ? new Date(timestamp).toLocaleDateString() : '',
+        time: timestamp ? new Date(timestamp).toLocaleTimeString() : ''
       });
     });
     
