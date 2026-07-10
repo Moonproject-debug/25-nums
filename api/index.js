@@ -46,7 +46,7 @@ const auth = admin.auth();
 // User Signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, password, referralCode } = req.body;
+    const { email, password } = req.body;
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
@@ -68,67 +68,15 @@ app.post('/api/auth/signup', async (req, res) => {
       email: email.toLowerCase().trim(),
       balance: 0,
       role: 'user',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      referralCode: null,
-      referredBy: null,
-      firstDepositDone: false
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    
-    // Generate unique referral code for user
-    const refCode = generateReferralCode(email);
-    await db.collection('users').doc(userId).update({
-      referralCode: refCode
-    });
-    
-    // Save referral code in referrals collection
-    await db.collection('referrals').doc(refCode).set({
-      userId: userId,
-      email: email.toLowerCase().trim(),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      referredUsers: [],
-      earnings: 0
-    });
-    
-    // Handle referral code from signup
-    if (referralCode && referralCode.trim() !== '') {
-      const refCodeTrim = referralCode.trim().toUpperCase();
-      const referrerDoc = await db.collection('referrals').doc(refCodeTrim).get();
-      
-      if (referrerDoc.exists) {
-        const referrerData = referrerDoc.data();
-        const referrerId = referrerData.userId;
-        
-        // Check if referrer exists and is not the same user
-        if (referrerId !== userId) {
-          // Update user's referredBy
-          await db.collection('users').doc(userId).update({
-            referredBy: referrerId
-          });
-          
-          // FIX: Use string timestamp instead of serverTimestamp() in array
-          const now = new Date().toISOString();
-          
-          // Add user to referrer's referredUsers list
-          await db.collection('referrals').doc(refCodeTrim).update({
-            referredUsers: admin.firestore.FieldValue.arrayUnion({
-              userId: userId,
-              email: email.toLowerCase().trim(),
-              joinedAt: now,
-              firstDepositDone: false,
-              commissionPaid: false
-            })
-          });
-        }
-      }
-    }
     
     console.log('User created successfully:', userId);
     
     res.json({
       success: true,
       userId: userId,
-      email: email.toLowerCase().trim(),
-      referralCode: refCode
+      email: email.toLowerCase().trim()
     });
     
   } catch (error) {
@@ -152,14 +100,6 @@ app.post('/api/auth/signup', async (req, res) => {
     });
   }
 });
-
-// Generate unique referral code
-function generateReferralCode(email) {
-  const prefix = 'MOON';
-  const random = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const emailPrefix = email.substring(0, 3).toUpperCase();
-  return `${prefix}${emailPrefix}${random}`;
-}
 
 // User Login
 app.post('/api/auth/login', async (req, res) => {
@@ -306,7 +246,7 @@ app.post('/api/admin/login', async (req, res) => {
 
 // ==================== USER ENDPOINTS ====================
 
-// Get user dashboard data (including referral info)
+// Get user dashboard data
 app.post('/api/user/dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -353,251 +293,15 @@ app.post('/api/user/dashboard', async (req, res) => {
       bulkPrices = bulkPricesDoc.data();
     }
     
-    // Get referral info
-    const referralCode = userData.referralCode || null;
-    const referredBy = userData.referredBy || null;
-    let referralStats = {
-      referralCode: referralCode,
-      referredBy: referredBy,
-      referredUsers: [],
-      earnings: 0,
-      totalReferred: 0
-    };
-    
-    if (referralCode) {
-      const referralDoc = await db.collection('referrals').doc(referralCode).get();
-      if (referralDoc.exists) {
-        const refData = referralDoc.data();
-        referralStats.referredUsers = refData.referredUsers || [];
-        referralStats.earnings = refData.earnings || 0;
-        referralStats.totalReferred = referralStats.referredUsers.length;
-      }
-    }
-    
     res.json({
       balance: userData.balance || 0,
       email: userData.email,
       priceList,
-      bulkPrices,
-      referral: referralStats,
-      firstDepositDone: userData.firstDepositDone || false
+      bulkPrices
     });
     
   } catch (error) {
     console.error('Dashboard error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ==================== REFERRAL ENDPOINTS ====================
-
-// Get referral stats
-app.post('/api/user/referral-stats', async (req, res) => {
-  try {
-    const { userId } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'UserId required' });
-    }
-    
-    const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const userData = userDoc.data();
-    const referralCode = userData.referralCode;
-    
-    if (!referralCode) {
-      return res.json({
-        success: true,
-        referralCode: null,
-        referredUsers: [],
-        earnings: 0,
-        totalReferred: 0
-      });
-    }
-    
-    const referralDoc = await db.collection('referrals').doc(referralCode).get();
-    
-    if (!referralDoc.exists) {
-      return res.json({
-        success: true,
-        referralCode: referralCode,
-        referredUsers: [],
-        earnings: 0,
-        totalReferred: 0
-      });
-    }
-    
-    const refData = referralDoc.data();
-    
-    res.json({
-      success: true,
-      referralCode: referralCode,
-      referredUsers: refData.referredUsers || [],
-      earnings: refData.earnings || 0,
-      totalReferred: (refData.referredUsers || []).length
-    });
-    
-  } catch (error) {
-    console.error('Referral stats error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Generate new referral code (if user doesn't have one)
-app.post('/api/user/generate-referral', async (req, res) => {
-  try {
-    const { userId } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'UserId required' });
-    }
-    
-    const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const userData = userDoc.data();
-    
-    if (userData.referralCode) {
-      return res.json({
-        success: true,
-        referralCode: userData.referralCode
-      });
-    }
-    
-    const email = userData.email;
-    const refCode = generateReferralCode(email);
-    
-    await db.collection('users').doc(userId).update({
-      referralCode: refCode
-    });
-    
-    await db.collection('referrals').doc(refCode).set({
-      userId: userId,
-      email: email,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      referredUsers: [],
-      earnings: 0
-    });
-    
-    res.json({
-      success: true,
-      referralCode: refCode
-    });
-    
-  } catch (error) {
-    console.error('Generate referral error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ==================== ADMIN: ADD BALANCE WITH REFERRAL CHECK ====================
-
-// Admin add balance - Check for referral commission
-app.post('/api/admin/update-user-balance', async (req, res) => {
-  try {
-    const { userId, newBalance } = req.body;
-    const adminToken = req.headers['admin-token'];
-    
-    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    
-    if (!userId || newBalance === undefined) {
-      return res.status(400).json({ error: 'UserId and newBalance required' });
-    }
-    
-    if (isNaN(parseInt(newBalance)) || parseInt(newBalance) < 0) {
-      return res.status(400).json({ error: 'Invalid balance value' });
-    }
-    
-    const newBalanceNum = parseInt(newBalance);
-    
-    // Get user data
-    const userDoc = await db.collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const userData = userDoc.data();
-    const currentBalance = userData.balance || 0;
-    const firstDepositDone = userData.firstDepositDone || false;
-    const referredBy = userData.referredBy || null;
-    
-    // Update user balance
-    await db.collection('users').doc(userId).update({
-      balance: newBalanceNum
-    });
-    
-    // Check for referral commission (only if first deposit and deposit >= 1000)
-    if (!firstDepositDone && newBalanceNum >= 1000 && referredBy) {
-      // Mark first deposit as done
-      await db.collection('users').doc(userId).update({
-        firstDepositDone: true
-      });
-      
-      // Get referrer's referral doc
-      const referrerDoc = await db.collection('users').doc(referredBy).get();
-      if (referrerDoc.exists) {
-        const referrerData = referrerDoc.data();
-        const referrerRefCode = referrerData.referralCode;
-        
-        if (referrerRefCode) {
-          // Add commission to referrer (70 PKR)
-          const commission = 70;
-          
-          // Update referrer's balance
-          await db.collection('users').doc(referredBy).update({
-            balance: admin.firestore.FieldValue.increment(commission)
-          });
-          
-          // Update referrer's referral earnings
-          await db.collection('referrals').doc(referrerRefCode).update({
-            earnings: admin.firestore.FieldValue.increment(commission)
-          });
-          
-          // Update referred user's status in referrer's list
-          const referralDoc = await db.collection('referrals').doc(referrerRefCode).get();
-          if (referralDoc.exists) {
-            const refData = referralDoc.data();
-            const referredUsers = refData.referredUsers || [];
-            const updatedUsers = referredUsers.map(u => {
-              if (u.userId === userId) {
-                return { ...u, firstDepositDone: true, commissionPaid: true };
-              }
-              return u;
-            });
-            
-            await db.collection('referrals').doc(referrerRefCode).update({
-              referredUsers: updatedUsers
-            });
-          }
-          
-          // Log commission
-          await db.collection('referralEarnings').add({
-            referrerId: referredBy,
-            referrerEmail: referrerData.email,
-            referredUserId: userId,
-            referredEmail: userData.email,
-            amount: commission,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-        }
-      }
-    }
-    
-    res.json({ 
-      success: true,
-      message: 'Balance updated successfully',
-      referralCommission: (!firstDepositDone && newBalanceNum >= 1000 && referredBy) ? 70 : 0
-    });
-    
-  } catch (error) {
-    console.error('Update balance error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2156,10 +1860,7 @@ app.post('/api/admin/users', async (req, res) => {
           email: doc.data().email,
           balance: doc.data().balance || 0,
           role: doc.data().role || 'user',
-          createdAt: doc.data().createdAt,
-          referralCode: doc.data().referralCode || null,
-          referredBy: doc.data().referredBy || null,
-          firstDepositDone: doc.data().firstDepositDone || false
+          createdAt: doc.data().createdAt
         });
       });
       
@@ -2184,10 +1885,7 @@ app.post('/api/admin/users', async (req, res) => {
         email: doc.data().email,
         balance: doc.data().balance || 0,
         role: doc.data().role || 'user',
-        createdAt: doc.data().createdAt,
-        referralCode: doc.data().referralCode || null,
-        referredBy: doc.data().referredBy || null,
-        firstDepositDone: doc.data().firstDepositDone || false
+        createdAt: doc.data().createdAt
       });
       lastId = doc.id;
     });
@@ -2204,43 +1902,32 @@ app.post('/api/admin/users', async (req, res) => {
   }
 });
 
-// Get all referral earnings
-app.post('/api/admin/referral-earnings', async (req, res) => {
+// Update user balance
+app.post('/api/admin/update-user-balance', async (req, res) => {
   try {
+    const { userId, newBalance } = req.body;
     const adminToken = req.headers['admin-token'];
     
     if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const earningsSnapshot = await db.collection('referralEarnings')
-      .orderBy('createdAt', 'desc')
-      .limit(100)
-      .get();
+    if (!userId || newBalance === undefined) {
+      return res.status(400).json({ error: 'UserId and newBalance required' });
+    }
     
-    const earnings = [];
-    earningsSnapshot.forEach(doc => {
-      const data = doc.data();
-      let timestamp = data.createdAt;
-      if (timestamp && timestamp.toDate) {
-        timestamp = timestamp.toDate().toISOString();
-      }
-      earnings.push({
-        id: doc.id,
-        referrerEmail: data.referrerEmail || '',
-        referredEmail: data.referredEmail || '',
-        amount: data.amount || 0,
-        createdAt: timestamp
-      });
+    if (isNaN(parseInt(newBalance)) || parseInt(newBalance) < 0) {
+      return res.status(400).json({ error: 'Invalid balance value' });
+    }
+    
+    await db.collection('users').doc(userId).update({
+      balance: parseInt(newBalance)
     });
     
-    res.json({
-      success: true,
-      earnings
-    });
+    res.json({ success: true });
     
   } catch (error) {
-    console.error('Get referral earnings error:', error);
+    console.error('Update balance error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2313,8 +2000,6 @@ app.get('/', (req, res) => {
       '/api/auth/login',
       '/api/admin/login',
       '/api/user/dashboard',
-      '/api/user/referral-stats',
-      '/api/user/generate-referral',
       '/api/user/transfer-balance',
       '/api/user/transfer-history',
       '/api/user/buy-number',
@@ -2331,7 +2016,6 @@ app.get('/', (req, res) => {
       '/api/proxy',
       '/api/admin/dashboard',
       '/api/admin/revenue-stats',
-      '/api/admin/referral-earnings',
       '/api/admin/add-numbers',
       '/api/admin/numbers',
       '/api/admin/delete-numbers',
