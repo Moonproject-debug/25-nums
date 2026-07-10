@@ -46,7 +46,7 @@ const auth = admin.auth();
 // User Signup
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, referralCode } = req.body;
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
@@ -61,19 +61,71 @@ app.post('/api/auth/signup', async (req, res) => {
       password: password,
     });
     
-    await db.collection('users').doc(userRecord.uid).set({
+    const userId = userRecord.uid;
+    
+    // Create user document
+    await db.collection('users').doc(userId).set({
       email: email.toLowerCase().trim(),
       balance: 0,
       role: 'user',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      referralCode: null,
+      referredBy: null,
+      firstDepositDone: false
     });
     
-    console.log('User created successfully:', userRecord.uid);
+    // Generate unique referral code for user
+    const refCode = generateReferralCode(email);
+    await db.collection('users').doc(userId).update({
+      referralCode: refCode
+    });
+    
+    // Save referral code in referrals collection
+    await db.collection('referrals').doc(refCode).set({
+      userId: userId,
+      email: email.toLowerCase().trim(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      referredUsers: [],
+      earnings: 0
+    });
+    
+    // Handle referral code from signup
+    if (referralCode && referralCode.trim() !== '') {
+      const refCodeTrim = referralCode.trim().toUpperCase();
+      const referrerDoc = await db.collection('referrals').doc(refCodeTrim).get();
+      
+      if (referrerDoc.exists) {
+        const referrerData = referrerDoc.data();
+        const referrerId = referrerData.userId;
+        
+        // Check if referrer exists and is not the same user
+        if (referrerId !== userId) {
+          // Update user's referredBy
+          await db.collection('users').doc(userId).update({
+            referredBy: referrerId
+          });
+          
+          // Add user to referrer's referredUsers list
+          await db.collection('referrals').doc(refCodeTrim).update({
+            referredUsers: admin.firestore.FieldValue.arrayUnion({
+              userId: userId,
+              email: email.toLowerCase().trim(),
+              joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+              firstDepositDone: false,
+              commissionPaid: false
+            })
+          });
+        }
+      }
+    }
+    
+    console.log('User created successfully:', userId);
     
     res.json({
       success: true,
-      userId: userRecord.uid,
-      email: email.toLowerCase().trim()
+      userId: userId,
+      email: email.toLowerCase().trim(),
+      referralCode: refCode
     });
     
   } catch (error) {
@@ -97,6 +149,14 @@ app.post('/api/auth/signup', async (req, res) => {
     });
   }
 });
+
+// Generate unique referral code
+function generateReferralCode(email) {
+  const prefix = 'MOON';
+  const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const emailPrefix = email.substring(0, 3).toUpperCase();
+  return `${prefix}${emailPrefix}${random}`;
+}
 
 // User Login
 app.post('/api/auth/login', async (req, res) => {
@@ -154,7 +214,7 @@ app.post('/api/auth/login', async (req, res) => {
         email: email.toLowerCase().trim(),
         balance: 0,
         role: 'user',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
     }
     
@@ -241,9 +301,9 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// ==================== USER ENDPOINTS (NORMAL NUMBERS) ====================
+// ==================== USER ENDPOINTS ====================
 
-// Get user balance, price list, and bulk prices (Normal Numbers)
+// Get user dashboard data (including referral info)
 app.post('/api/user/dashboard', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -288,15 +348,251 @@ app.post('/api/user/dashboard', async (req, res) => {
       bulkPrices = bulkPricesDoc.data();
     }
     
+    // Get referral info
+    const referralCode = userData.referralCode || null;
+    const referredBy = userData.referredBy || null;
+    let referralStats = {
+      referralCode: referralCode,
+      referredBy: referredBy,
+      referredUsers: [],
+      earnings: 0,
+      totalReferred: 0
+    };
+    
+    if (referralCode) {
+      const referralDoc = await db.collection('referrals').doc(referralCode).get();
+      if (referralDoc.exists) {
+        const refData = referralDoc.data();
+        referralStats.referredUsers = refData.referredUsers || [];
+        referralStats.earnings = refData.earnings || 0;
+        referralStats.totalReferred = referralStats.referredUsers.length;
+      }
+    }
+    
     res.json({
       balance: userData.balance || 0,
       email: userData.email,
       priceList,
-      bulkPrices
+      bulkPrices,
+      referral: referralStats,
+      firstDepositDone: userData.firstDepositDone || false
     });
     
   } catch (error) {
     console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== REFERRAL ENDPOINTS ====================
+
+// Get referral stats
+app.post('/api/user/referral-stats', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+    
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    const referralCode = userData.referralCode;
+    
+    if (!referralCode) {
+      return res.json({
+        success: true,
+        referralCode: null,
+        referredUsers: [],
+        earnings: 0,
+        totalReferred: 0
+      });
+    }
+    
+    const referralDoc = await db.collection('referrals').doc(referralCode).get();
+    
+    if (!referralDoc.exists) {
+      return res.json({
+        success: true,
+        referralCode: referralCode,
+        referredUsers: [],
+        earnings: 0,
+        totalReferred: 0
+      });
+    }
+    
+    const refData = referralDoc.data();
+    
+    res.json({
+      success: true,
+      referralCode: referralCode,
+      referredUsers: refData.referredUsers || [],
+      earnings: refData.earnings || 0,
+      totalReferred: (refData.referredUsers || []).length
+    });
+    
+  } catch (error) {
+    console.error('Referral stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Generate new referral code (if user doesn't have one)
+app.post('/api/user/generate-referral', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+    
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    
+    if (userData.referralCode) {
+      return res.json({
+        success: true,
+        referralCode: userData.referralCode
+      });
+    }
+    
+    const email = userData.email;
+    const refCode = generateReferralCode(email);
+    
+    await db.collection('users').doc(userId).update({
+      referralCode: refCode
+    });
+    
+    await db.collection('referrals').doc(refCode).set({
+      userId: userId,
+      email: email,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      referredUsers: [],
+      earnings: 0
+    });
+    
+    res.json({
+      success: true,
+      referralCode: refCode
+    });
+    
+  } catch (error) {
+    console.error('Generate referral error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== ADMIN: ADD BALANCE WITH REFERRAL CHECK ====================
+
+// Admin add balance - Check for referral commission
+app.post('/api/admin/update-user-balance', async (req, res) => {
+  try {
+    const { userId, newBalance } = req.body;
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    if (!userId || newBalance === undefined) {
+      return res.status(400).json({ error: 'UserId and newBalance required' });
+    }
+    
+    if (isNaN(parseInt(newBalance)) || parseInt(newBalance) < 0) {
+      return res.status(400).json({ error: 'Invalid balance value' });
+    }
+    
+    const newBalanceNum = parseInt(newBalance);
+    
+    // Get user data
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    const currentBalance = userData.balance || 0;
+    const firstDepositDone = userData.firstDepositDone || false;
+    const referredBy = userData.referredBy || null;
+    
+    // Update user balance
+    await db.collection('users').doc(userId).update({
+      balance: newBalanceNum
+    });
+    
+    // Check for referral commission (only if first deposit and deposit >= 1000)
+    if (!firstDepositDone && newBalanceNum >= 1000 && referredBy) {
+      // Mark first deposit as done
+      await db.collection('users').doc(userId).update({
+        firstDepositDone: true
+      });
+      
+      // Get referrer's referral doc
+      const referrerDoc = await db.collection('users').doc(referredBy).get();
+      if (referrerDoc.exists) {
+        const referrerData = referrerDoc.data();
+        const referrerRefCode = referrerData.referralCode;
+        
+        if (referrerRefCode) {
+          // Add commission to referrer (70 PKR)
+          const commission = 70;
+          
+          // Update referrer's balance
+          await db.collection('users').doc(referredBy).update({
+            balance: admin.firestore.FieldValue.increment(commission)
+          });
+          
+          // Update referrer's referral earnings
+          await db.collection('referrals').doc(referrerRefCode).update({
+            earnings: admin.firestore.FieldValue.increment(commission)
+          });
+          
+          // Update referred user's status in referrer's list
+          const referralDoc = await db.collection('referrals').doc(referrerRefCode).get();
+          if (referralDoc.exists) {
+            const refData = referralDoc.data();
+            const referredUsers = refData.referredUsers || [];
+            const updatedUsers = referredUsers.map(u => {
+              if (u.userId === userId) {
+                return { ...u, firstDepositDone: true, commissionPaid: true };
+              }
+              return u;
+            });
+            
+            await db.collection('referrals').doc(referrerRefCode).update({
+              referredUsers: updatedUsers
+            });
+          }
+          
+          // Log commission
+          await db.collection('referralEarnings').add({
+            referrerId: referredBy,
+            referrerEmail: referrerData.email,
+            referredUserId: userId,
+            referredEmail: userData.email,
+            amount: commission,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+      }
+    }
+    
+    res.json({ 
+      success: true,
+      message: 'Balance updated successfully',
+      referralCommission: (!firstDepositDone && newBalanceNum >= 1000 && referredBy) ? 70 : 0
+    });
+    
+  } catch (error) {
+    console.error('Update balance error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -440,7 +736,6 @@ app.post('/api/user/transfer-history', async (req, res) => {
     const transfers = [];
     transfersSnapshot.forEach(doc => {
       const data = doc.data();
-      // Convert timestamp to readable format
       let timestamp = data.timestamp;
       if (timestamp && timestamp.toDate) {
         timestamp = timestamp.toDate().toISOString();
@@ -559,7 +854,7 @@ app.post('/api/user/buy-number', async (req, res) => {
   }
 });
 
-// Buy bulk numbers (Normal Numbers) - FIXED BALANCE DEDUCTION
+// Buy bulk numbers (Normal Numbers)
 app.post('/api/user/bulk-buy-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -572,7 +867,6 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       return res.status(400).json({ error: 'Quantity must be 10 or 20' });
     }
     
-    // Get bulk price
     const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
     if (!bulkPricesDoc.exists) {
       return res.status(400).json({ error: 'Bulk prices not set by admin' });
@@ -597,12 +891,10 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       const userData = userDoc.data();
       const currentBalance = userData.balance || 0;
       
-      // CHECK BALANCE
       if (currentBalance < totalPrice) {
         throw new Error(`Insufficient balance. Need ${totalPrice} PKR, you have ${currentBalance} PKR`);
       }
       
-      // Find available numbers (any price, but we'll use them)
       const numbersQuery = await db.collection('numbers')
         .where('status', '==', 'available')
         .limit(quantity)
@@ -615,22 +907,18 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       const purchasedNumbers = [];
       const priceUpdates = {};
       
-      // Process each number
       for (const doc of numbersQuery.docs) {
         const numberData = doc.data();
         const price = numberData.price;
         
-        // Update number status
         transaction.update(doc.ref, {
           status: 'sold',
           soldTo: userId,
           soldAt: admin.firestore.FieldValue.serverTimestamp()
         });
         
-        // Track price updates
         priceUpdates[price] = (priceUpdates[price] || 0) + 1;
         
-        // Add to user's purchased collection
         const userNumberRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
         transaction.set(userNumberRef, {
           number: numberData.number,
@@ -651,7 +939,6 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
         });
       }
       
-      // Update price counts
       for (const [price, count] of Object.entries(priceUpdates)) {
         const priceCountRef = db.collection('priceCounts').doc(price);
         transaction.update(priceCountRef, {
@@ -660,7 +947,6 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
         });
       }
       
-      // DEDUCT BALANCE - FIXED
       transaction.update(userRef, {
         balance: admin.firestore.FieldValue.increment(-totalPrice)
       });
@@ -929,7 +1215,7 @@ app.post('/api/user/buy-id-number', async (req, res) => {
   }
 });
 
-// Buy bulk ID numbers - FIXED BALANCE DEDUCTION
+// Buy bulk ID numbers
 app.post('/api/user/bulk-buy-id-number', async (req, res) => {
   try {
     const { userId, quantity } = req.body;
@@ -942,7 +1228,6 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       return res.status(400).json({ error: 'Quantity must be 10 or 20' });
     }
     
-    // Get bulk price
     const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
     if (!bulkPricesDoc.exists) {
       return res.status(400).json({ error: 'Bulk prices not set by admin' });
@@ -967,12 +1252,10 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       const userData = userDoc.data();
       const currentBalance = userData.balance || 0;
       
-      // CHECK BALANCE
       if (currentBalance < totalPrice) {
         throw new Error(`Insufficient balance. Need ${totalPrice} PKR, you have ${currentBalance} PKR`);
       }
       
-      // Find available ID numbers
       const numbersQuery = await db.collection('idNumbers')
         .where('status', '==', 'available')
         .limit(quantity)
@@ -985,22 +1268,18 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       const purchasedNumbers = [];
       const priceUpdates = {};
       
-      // Process each number
       for (const doc of numbersQuery.docs) {
         const numberData = doc.data();
         const price = numberData.price;
         
-        // Update number status
         transaction.update(doc.ref, {
           status: 'sold',
           soldTo: userId,
           soldAt: admin.firestore.FieldValue.serverTimestamp()
         });
         
-        // Track price updates
         priceUpdates[price] = (priceUpdates[price] || 0) + 1;
         
-        // Add to user's purchased collection
         const userNumberRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
         transaction.set(userNumberRef, {
           number: numberData.number,
@@ -1021,7 +1300,6 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
         });
       }
       
-      // Update price counts
       for (const [price, count] of Object.entries(priceUpdates)) {
         const priceCountRef = db.collection('idPriceCounts').doc(price);
         transaction.update(priceCountRef, {
@@ -1030,7 +1308,6 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
         });
       }
       
-      // DEDUCT BALANCE - FIXED
       transaction.update(userRef, {
         balance: admin.firestore.FieldValue.increment(-totalPrice)
       });
@@ -1179,7 +1456,7 @@ app.post('/api/proxy', async (req, res) => {
   }
 });
 
-// ==================== ADMIN ENDPOINTS (NORMAL NUMBERS) ====================
+// ==================== ADMIN ENDPOINTS ====================
 
 // Admin Dashboard Stats
 app.post('/api/admin/dashboard', async (req, res) => {
@@ -1233,7 +1510,7 @@ app.post('/api/admin/dashboard', async (req, res) => {
 
 // ==================== ADMIN REVENUE STATS ====================
 
-// Get revenue stats - Total balance in user accounts + Total revenue from sold numbers
+// Get revenue stats
 app.post('/api/admin/revenue-stats', async (req, res) => {
   try {
     const adminToken = req.headers['admin-token'];
@@ -1242,7 +1519,6 @@ app.post('/api/admin/revenue-stats', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Get all users to sum their balances
     const usersSnapshot = await db.collection('users').get();
     let totalUserBalance = 0;
     let totalUsers = 0;
@@ -1253,13 +1529,11 @@ app.post('/api/admin/revenue-stats', async (req, res) => {
       totalUsers++;
     });
     
-    // Get all sold numbers (normal + ID) to calculate revenue
     let totalRevenueNormal = 0;
     let totalRevenueId = 0;
     let totalSoldNormal = 0;
     let totalSoldId = 0;
     
-    // Get sold normal numbers
     const soldNormalSnapshot = await db.collection('numbers')
       .where('status', '==', 'sold')
       .get();
@@ -1270,7 +1544,6 @@ app.post('/api/admin/revenue-stats', async (req, res) => {
       totalSoldNormal++;
     });
     
-    // Get sold ID numbers
     const soldIdSnapshot = await db.collection('idNumbers')
       .where('status', '==', 'sold')
       .get();
@@ -1768,7 +2041,6 @@ app.post('/api/admin/set-bulk-prices', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    // Validate prices
     const prices = [
       { key: 'normal_10', value: normal_10 },
       { key: 'normal_20', value: normal_20 },
@@ -1866,7 +2138,10 @@ app.post('/api/admin/users', async (req, res) => {
           email: doc.data().email,
           balance: doc.data().balance || 0,
           role: doc.data().role || 'user',
-          createdAt: doc.data().createdAt
+          createdAt: doc.data().createdAt,
+          referralCode: doc.data().referralCode || null,
+          referredBy: doc.data().referredBy || null,
+          firstDepositDone: doc.data().firstDepositDone || false
         });
       });
       
@@ -1891,7 +2166,10 @@ app.post('/api/admin/users', async (req, res) => {
         email: doc.data().email,
         balance: doc.data().balance || 0,
         role: doc.data().role || 'user',
-        createdAt: doc.data().createdAt
+        createdAt: doc.data().createdAt,
+        referralCode: doc.data().referralCode || null,
+        referredBy: doc.data().referredBy || null,
+        firstDepositDone: doc.data().firstDepositDone || false
       });
       lastId = doc.id;
     });
@@ -1908,32 +2186,43 @@ app.post('/api/admin/users', async (req, res) => {
   }
 });
 
-// Update user balance
-app.post('/api/admin/update-user-balance', async (req, res) => {
+// Get all referral earnings
+app.post('/api/admin/referral-earnings', async (req, res) => {
   try {
-    const { userId, newBalance } = req.body;
     const adminToken = req.headers['admin-token'];
     
     if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    if (!userId || newBalance === undefined) {
-      return res.status(400).json({ error: 'UserId and newBalance required' });
-    }
+    const earningsSnapshot = await db.collection('referralEarnings')
+      .orderBy('createdAt', 'desc')
+      .limit(100)
+      .get();
     
-    if (isNaN(parseInt(newBalance)) || parseInt(newBalance) < 0) {
-      return res.status(400).json({ error: 'Invalid balance value' });
-    }
-    
-    await db.collection('users').doc(userId).update({
-      balance: parseInt(newBalance)
+    const earnings = [];
+    earningsSnapshot.forEach(doc => {
+      const data = doc.data();
+      let timestamp = data.createdAt;
+      if (timestamp && timestamp.toDate) {
+        timestamp = timestamp.toDate().toISOString();
+      }
+      earnings.push({
+        id: doc.id,
+        referrerEmail: data.referrerEmail || '',
+        referredEmail: data.referredEmail || '',
+        amount: data.amount || 0,
+        createdAt: timestamp
+      });
     });
     
-    res.json({ success: true });
+    res.json({
+      success: true,
+      earnings
+    });
     
   } catch (error) {
-    console.error('Update balance error:', error);
+    console.error('Get referral earnings error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1987,10 +2276,10 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Version endpoint for cache busting
+// Version endpoint
 app.get('/api/version', (req, res) => {
   res.json({ 
-    version: '4.0.0',
+    version: '4.0.2',
     timestamp: Date.now()
   });
 });
@@ -2006,6 +2295,8 @@ app.get('/', (req, res) => {
       '/api/auth/login',
       '/api/admin/login',
       '/api/user/dashboard',
+      '/api/user/referral-stats',
+      '/api/user/generate-referral',
       '/api/user/transfer-balance',
       '/api/user/transfer-history',
       '/api/user/buy-number',
@@ -2022,6 +2313,7 @@ app.get('/', (req, res) => {
       '/api/proxy',
       '/api/admin/dashboard',
       '/api/admin/revenue-stats',
+      '/api/admin/referral-earnings',
       '/api/admin/add-numbers',
       '/api/admin/numbers',
       '/api/admin/delete-numbers',
