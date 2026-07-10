@@ -301,6 +301,161 @@ app.post('/api/user/dashboard', async (req, res) => {
   }
 });
 
+// ==================== USER BALANCE TRANSFER ====================
+
+// Transfer balance from one user to another
+app.post('/api/user/transfer-balance', async (req, res) => {
+  try {
+    const { userId, recipientEmail, amount } = req.body;
+    
+    if (!userId || !recipientEmail || !amount) {
+      return res.status(400).json({ error: 'UserId, recipient email, and amount required' });
+    }
+    
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+    
+    const amountNum = parseInt(amount);
+    
+    // Don't allow transfer to self
+    const senderDoc = await db.collection('users').doc(userId).get();
+    if (!senderDoc.exists) {
+      return res.status(404).json({ error: 'Sender not found' });
+    }
+    
+    const senderData = senderDoc.data();
+    if (senderData.email.toLowerCase() === recipientEmail.toLowerCase()) {
+      return res.status(400).json({ error: 'Cannot transfer to yourself' });
+    }
+    
+    if (senderData.balance < amountNum) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    
+    // Find recipient by email
+    const recipientSnapshot = await db.collection('users')
+      .where('email', '==', recipientEmail.toLowerCase().trim())
+      .limit(1)
+      .get();
+    
+    if (recipientSnapshot.empty) {
+      return res.status(404).json({ error: 'Recipient user not found' });
+    }
+    
+    const recipientDoc = recipientSnapshot.docs[0];
+    const recipientId = recipientDoc.id;
+    const recipientData = recipientDoc.data();
+    
+    // Don't allow transfer to admin accounts
+    if (recipientData.role === 'admin') {
+      return res.status(400).json({ error: 'Cannot transfer to admin account' });
+    }
+    
+    // Perform transaction
+    await db.runTransaction(async (transaction) => {
+      const senderRef = db.collection('users').doc(userId);
+      const recipientRef = db.collection('users').doc(recipientId);
+      
+      const senderSnapshot = await transaction.get(senderRef);
+      const recipientSnapshot2 = await transaction.get(recipientRef);
+      
+      if (!senderSnapshot.exists || !recipientSnapshot2.exists) {
+        throw new Error('User not found');
+      }
+      
+      const senderData2 = senderSnapshot.data();
+      if (senderData2.balance < amountNum) {
+        throw new Error('Insufficient balance');
+      }
+      
+      // Deduct from sender
+      transaction.update(senderRef, {
+        balance: admin.firestore.FieldValue.increment(-amountNum)
+      });
+      
+      // Add to recipient
+      transaction.update(recipientRef, {
+        balance: admin.firestore.FieldValue.increment(amountNum)
+      });
+      
+      // Log transaction in sender's transfer history
+      const transferRef = db.collection('users').doc(userId)
+        .collection('transfers').doc();
+      transaction.set(transferRef, {
+        type: 'sent',
+        recipientEmail: recipientEmail.toLowerCase().trim(),
+        recipientId: recipientId,
+        amount: amountNum,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        balanceAfter: senderData2.balance - amountNum
+      });
+      
+      // Log transaction in recipient's transfer history
+      const recipientTransferRef = db.collection('users').doc(recipientId)
+        .collection('transfers').doc();
+      transaction.set(recipientTransferRef, {
+        type: 'received',
+        senderEmail: senderData.email,
+        senderId: userId,
+        amount: amountNum,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        balanceAfter: (recipientData.balance || 0) + amountNum
+      });
+    });
+    
+    // Get updated balance
+    const updatedSender = await db.collection('users').doc(userId).get();
+    const newBalance = updatedSender.data().balance || 0;
+    
+    res.json({
+      success: true,
+      message: `Successfully transferred ${amountNum} PKR to ${recipientEmail}`,
+      newBalance: newBalance,
+      transferredAmount: amountNum,
+      recipientEmail: recipientEmail
+    });
+    
+  } catch (error) {
+    console.error('Transfer balance error:', error);
+    res.status(400).json({ error: error.message || 'Transfer failed' });
+  }
+});
+
+// Get user's transfer history
+app.post('/api/user/transfer-history', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+    
+    const transfersSnapshot = await db.collection('users').doc(userId)
+      .collection('transfers')
+      .orderBy('timestamp', 'desc')
+      .limit(50)
+      .get();
+    
+    const transfers = [];
+    transfersSnapshot.forEach(doc => {
+      transfers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
+    res.json({
+      success: true,
+      transfers
+    });
+    
+  } catch (error) {
+    console.error('Get transfer history error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Buy single number (Normal Numbers)
 app.post('/api/user/buy-number', async (req, res) => {
   try {
@@ -1063,7 +1218,7 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// ==================== ADMIN REVENUE STATS (NEW) ====================
+// ==================== ADMIN REVENUE STATS ====================
 
 // Get revenue stats - Total balance in user accounts + Total revenue from sold numbers
 app.post('/api/admin/revenue-stats', async (req, res) => {
@@ -1120,13 +1275,13 @@ app.post('/api/admin/revenue-stats', async (req, res) => {
       success: true,
       stats: {
         totalUsers: totalUsers,
-        totalUserBalance: totalUserBalance, // Total balance in all user accounts
-        totalRevenueNormal: totalRevenueNormal, // Revenue from normal numbers
-        totalRevenueId: totalRevenueId, // Revenue from ID numbers
-        totalRevenue: totalRevenue, // Total revenue (normal + ID)
-        totalSoldNormal: totalSoldNormal, // Count of sold normal numbers
-        totalSoldId: totalSoldId, // Count of sold ID numbers
-        totalSoldNumbers: totalSoldNumbers // Total sold numbers
+        totalUserBalance: totalUserBalance,
+        totalRevenueNormal: totalRevenueNormal,
+        totalRevenueId: totalRevenueId,
+        totalRevenue: totalRevenue,
+        totalSoldNormal: totalSoldNormal,
+        totalSoldId: totalSoldId,
+        totalSoldNumbers: totalSoldNumbers
       }
     });
     
@@ -1838,6 +1993,8 @@ app.get('/', (req, res) => {
       '/api/auth/login',
       '/api/admin/login',
       '/api/user/dashboard',
+      '/api/user/transfer-balance',
+      '/api/user/transfer-history',
       '/api/user/buy-number',
       '/api/user/bulk-buy-number',
       '/api/user/my-numbers',
