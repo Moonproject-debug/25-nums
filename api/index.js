@@ -1219,6 +1219,75 @@ app.post('/api/admin/dashboard', async (req, res) => {
   }
 });
 
+// ==================== ADMIN REVENUE STATS ====================
+
+// Get revenue stats
+app.post('/api/admin/revenue-stats', async (req, res) => {
+  try {
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const usersSnapshot = await db.collection('users').get();
+    let totalUserBalance = 0;
+    let totalUsers = 0;
+    
+    usersSnapshot.forEach(doc => {
+      const userData = doc.data();
+      totalUserBalance += (userData.balance || 0);
+      totalUsers++;
+    });
+    
+    let totalRevenueNormal = 0;
+    let totalRevenueId = 0;
+    let totalSoldNormal = 0;
+    let totalSoldId = 0;
+    
+    const soldNormalSnapshot = await db.collection('numbers')
+      .where('status', '==', 'sold')
+      .get();
+    
+    soldNormalSnapshot.forEach(doc => {
+      const data = doc.data();
+      totalRevenueNormal += parseInt(data.price) || 0;
+      totalSoldNormal++;
+    });
+    
+    const soldIdSnapshot = await db.collection('idNumbers')
+      .where('status', '==', 'sold')
+      .get();
+    
+    soldIdSnapshot.forEach(doc => {
+      const data = doc.data();
+      totalRevenueId += parseInt(data.price) || 0;
+      totalSoldId++;
+    });
+    
+    const totalRevenue = totalRevenueNormal + totalRevenueId;
+    const totalSoldNumbers = totalSoldNormal + totalSoldId;
+    
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: totalUsers,
+        totalUserBalance: totalUserBalance,
+        totalRevenueNormal: totalRevenueNormal,
+        totalRevenueId: totalRevenueId,
+        totalRevenue: totalRevenue,
+        totalSoldNormal: totalSoldNormal,
+        totalSoldId: totalSoldId,
+        totalSoldNumbers: totalSoldNumbers
+      }
+    });
+    
+  } catch (error) {
+    console.error('Revenue stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Add numbers (Normal Numbers)
 app.post('/api/admin/add-numbers', async (req, res) => {
   try {
@@ -1915,7 +1984,7 @@ app.get('/api/health', (req, res) => {
 // Version endpoint
 app.get('/api/version', (req, res) => {
   res.json({ 
-    version: '4.0.3',
+    version: '4.0.2',
     timestamp: Date.now()
   });
 });
@@ -1946,6 +2015,7 @@ app.get('/', (req, res) => {
       '/api/user/delete-id-numbers',
       '/api/proxy',
       '/api/admin/dashboard',
+      '/api/admin/revenue-stats',
       '/api/admin/add-numbers',
       '/api/admin/numbers',
       '/api/admin/delete-numbers',
