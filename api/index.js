@@ -793,18 +793,31 @@ app.post('/api/user/id-dashboard', async (req, res) => {
     
     const userData = userDoc.data();
     
-    const idPriceCountsSnapshot = await db.collection('idPriceCounts').get();
+    // FIX: Directly count available ID numbers by price
+    const idNumbersSnapshot = await db.collection('idNumbers')
+      .where('status', '==', 'available')
+      .get();
     
-    const priceList = [];
-    idPriceCountsSnapshot.forEach(doc => {
+    const priceMap = {};
+    idNumbersSnapshot.forEach(doc => {
       const data = doc.data();
-      if (data.availableCount > 0) {
-        priceList.push({
-          price: doc.id,
-          availableCount: data.availableCount
-        });
+      const price = data.price;
+      if (priceMap[price]) {
+        priceMap[price]++;
+      } else {
+        priceMap[price] = 1;
       }
     });
+    
+    const priceList = [];
+    for (const [price, count] of Object.entries(priceMap)) {
+      if (count > 0) {
+        priceList.push({
+          price: price,
+          availableCount: count
+        });
+      }
+    }
     
     priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
