@@ -402,13 +402,12 @@ app.post('/api/user/combined-dashboard', async (req, res) => {
       .map(([price, availableCount]) => ({ price, availableCount }))
       .sort((a, b) => parseInt(a.price) - parseInt(b.price));
 
-    // Get user's purchased normal numbers (limit 100)
+    // Get user's purchased normal numbers - NO LIMIT
     const normalPurchasedSnapshot = await db.collection('users').doc(userId)
       .collection('purchased')
       .where('status', '==', 'active')
       .where('type', '==', 'normal')
       .orderBy('purchasedAt', 'desc')
-      .limit(100)
       .get();
     
     const myNumbers = [];
@@ -416,13 +415,12 @@ app.post('/api/user/combined-dashboard', async (req, res) => {
       myNumbers.push({ id: doc.id, ...doc.data() });
     });
 
-    // Get user's purchased ID numbers (limit 100)
+    // Get user's purchased ID numbers - NO LIMIT
     const idPurchasedSnapshot = await db.collection('users').doc(userId)
       .collection('purchased')
       .where('status', '==', 'active')
       .where('type', '==', 'id')
       .orderBy('purchasedAt', 'desc')
-      .limit(100)
       .get();
     
     const myIdNumbers = [];
@@ -1003,7 +1001,7 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
   }
 });
 
-// Get user's purchased numbers (Normal Numbers)
+// Get user's purchased numbers (Normal Numbers) - NO LIMIT
 app.post('/api/user/my-numbers', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -1017,7 +1015,6 @@ app.post('/api/user/my-numbers', async (req, res) => {
       .where('status', '==', 'active')
       .where('type', '==', 'normal')
       .orderBy('purchasedAt', 'desc')
-      .limit(100)
       .get();
     
     const numbers = [];
@@ -1369,7 +1366,7 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
   }
 });
 
-// Get user's purchased ID numbers
+// Get user's purchased ID numbers - NO LIMIT
 app.post('/api/user/my-id-numbers', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -1383,7 +1380,6 @@ app.post('/api/user/my-id-numbers', async (req, res) => {
       .where('status', '==', 'active')
       .where('type', '==', 'id')
       .orderBy('purchasedAt', 'desc')
-      .limit(100)
       .get();
     
     const numbers = [];
