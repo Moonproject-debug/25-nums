@@ -41,6 +41,129 @@ try {
 const db = admin.firestore();
 const auth = admin.auth();
 
+// ============================================
+// CACHE SYSTEM - OPTIMIZATION
+// ============================================
+let cache = {
+  priceCounts: null,
+  idPriceCounts: null,
+  adminCounters: null,
+  timestamp: 0
+};
+const CACHE_TTL = 60000; // 1 minute
+
+async function getCachedPriceCounts() {
+  const now = Date.now();
+  
+  if (cache.priceCounts && cache.idPriceCounts && (now - cache.timestamp) < CACHE_TTL) {
+    return {
+      normal: cache.priceCounts,
+      id: cache.idPriceCounts
+    };
+  }
+  
+  const [normalSnapshot, idSnapshot] = await Promise.all([
+    db.collection('priceCounts').get(),
+    db.collection('idPriceCounts').get()
+  ]);
+  
+  const normal = {};
+  normalSnapshot.forEach(doc => {
+    normal[doc.id] = doc.data().availableCount || 0;
+  });
+  
+  const id = {};
+  idSnapshot.forEach(doc => {
+    id[doc.id] = doc.data().availableCount || 0;
+  });
+  
+  cache.priceCounts = normal;
+  cache.idPriceCounts = id;
+  cache.timestamp = now;
+  
+  return { normal, id };
+}
+
+async function getCachedAdminCounters() {
+  const now = Date.now();
+  
+  if (cache.adminCounters && (now - cache.timestamp) < CACHE_TTL) {
+    return cache.adminCounters;
+  }
+  
+  const countersDoc = await db.collection('meta').doc('counters').get();
+  
+  if (countersDoc.exists) {
+    const data = countersDoc.data();
+    cache.adminCounters = data;
+    cache.timestamp = now;
+    return data;
+  }
+  
+  // Calculate if not exists
+  const [
+    usersCount,
+    availableCount,
+    soldCount,
+    idAvailableCount,
+    idSoldCount
+  ] = await Promise.all([
+    db.collection('users').count().get(),
+    db.collection('numbers').where('status', '==', 'available').count().get(),
+    db.collection('numbers').where('status', '==', 'sold').count().get(),
+    db.collection('idNumbers').where('status', '==', 'available').count().get(),
+    db.collection('idNumbers').where('status', '==', 'sold').count().get()
+  ]);
+  
+  const counters = {
+    totalUsers: usersCount.data().count || 0,
+    availableNumbers: availableCount.data().count || 0,
+    soldNumbers: soldCount.data().count || 0,
+    idAvailableNumbers: idAvailableCount.data().count || 0,
+    idSoldNumbers: idSoldCount.data().count || 0,
+    updatedAt: Date.now()
+  };
+  
+  await db.collection('meta').doc('counters').set(counters);
+  
+  cache.adminCounters = counters;
+  cache.timestamp = now;
+  
+  return counters;
+}
+
+async function updateAdminCounters() {
+  const [
+    usersCount,
+    availableCount,
+    soldCount,
+    idAvailableCount,
+    idSoldCount
+  ] = await Promise.all([
+    db.collection('users').count().get(),
+    db.collection('numbers').where('status', '==', 'available').count().get(),
+    db.collection('numbers').where('status', '==', 'sold').count().get(),
+    db.collection('idNumbers').where('status', '==', 'available').count().get(),
+    db.collection('idNumbers').where('status', '==', 'sold').count().get()
+  ]);
+  
+  const counters = {
+    totalUsers: usersCount.data().count || 0,
+    availableNumbers: availableCount.data().count || 0,
+    soldNumbers: soldCount.data().count || 0,
+    idAvailableNumbers: idAvailableCount.data().count || 0,
+    idSoldNumbers: idSoldCount.data().count || 0,
+    updatedAt: Date.now()
+  };
+  
+  await db.collection('meta').doc('counters').set(counters);
+  
+  cache.adminCounters = counters;
+  cache.timestamp = Date.now();
+  
+  return counters;
+}
+
 // ==================== AUTH ENDPOINTS ====================
 
 // User Signup
@@ -70,6 +193,9 @@ app.post('/api/auth/signup', async (req, res) => {
       role: 'user',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    
+    // Update counters
+    await updateAdminCounters();
     
     console.log('User created successfully:', userId);
     
@@ -159,6 +285,7 @@ app.post('/api/auth/login', async (req, res) => {
         role: 'user',
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
+      await updateAdminCounters();
     }
     
     res.json({
@@ -244,6 +371,197 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
+// ==================== COMBINED USER DASHBOARD - OPTIMIZED ====================
+
+app.post('/api/user/combined-dashboard', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'UserId required' });
+    }
+
+    // Get user data
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+
+    // Get cached price counts
+    const priceCounts = await getCachedPriceCounts();
+
+    // Build price lists from cached counts
+    const normalPriceList = Object.entries(priceCounts.normal)
+      .filter(([_, count]) => count > 0)
+      .map(([price, availableCount]) => ({ price, availableCount }))
+      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
+
+    const idPriceList = Object.entries(priceCounts.id)
+      .filter(([_, count]) => count > 0)
+      .map(([price, availableCount]) => ({ price, availableCount }))
+      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
+
+    // Get user's purchased normal numbers (limit 100)
+    const normalPurchasedSnapshot = await db.collection('users').doc(userId)
+      .collection('purchased')
+      .where('status', '==', 'active')
+      .where('type', '==', 'normal')
+      .orderBy('purchasedAt', 'desc')
+      .limit(100)
+      .get();
+    
+    const myNumbers = [];
+    normalPurchasedSnapshot.forEach(doc => {
+      myNumbers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Get user's purchased ID numbers (limit 100)
+    const idPurchasedSnapshot = await db.collection('users').doc(userId)
+      .collection('purchased')
+      .where('status', '==', 'active')
+      .where('type', '==', 'id')
+      .orderBy('purchasedAt', 'desc')
+      .limit(100)
+      .get();
+    
+    const myIdNumbers = [];
+    idPurchasedSnapshot.forEach(doc => {
+      myIdNumbers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Get bulk prices
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    let bulkPrices = {
+      normal_10: null,
+      normal_20: null,
+      id_10: null,
+      id_20: null,
+      id_50: null,
+      id_100: null
+    };
+    if (bulkPricesDoc.exists) {
+      bulkPrices = bulkPricesDoc.data();
+    }
+
+    // Get transfer history (last 20)
+    const transfersSnapshot = await db.collection('users').doc(userId)
+      .collection('transfers')
+      .orderBy('timestamp', 'desc')
+      .limit(20)
+      .get();
+    
+    const transfers = [];
+    transfersSnapshot.forEach(doc => {
+      const data = doc.data();
+      let timestamp = data.timestamp;
+      if (timestamp && timestamp.toDate) {
+        timestamp = timestamp.toDate().toISOString();
+      }
+      transfers.push({
+        id: doc.id,
+        type: data.type || 'unknown',
+        recipientEmail: data.recipientEmail || '',
+        senderEmail: data.senderEmail || '',
+        amount: data.amount || 0,
+        balanceAfter: data.balanceAfter || 0,
+        timestamp: timestamp,
+        date: timestamp ? new Date(timestamp).toLocaleDateString() : '',
+        time: timestamp ? new Date(timestamp).toLocaleTimeString() : ''
+      });
+    });
+
+    res.json({
+      success: true,
+      balance: userData.balance || 0,
+      email: userData.email || '',
+      normalPriceList,
+      idPriceList,
+      myNumbers,
+      myIdNumbers,
+      bulkPrices,
+      transfers
+    });
+
+  } catch (error) {
+    console.error('Combined dashboard error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== COMBINED ADMIN DASHBOARD - OPTIMIZED ====================
+
+app.post('/api/admin/combined-dashboard', async (req, res) => {
+  try {
+    const adminToken = req.headers['admin-token'];
+    
+    if (!adminToken || adminToken !== process.env.ADMIN_SECRET_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Get cached counters
+    const counters = await getCachedAdminCounters();
+
+    // Get numbers (first 30)
+    const numbersQuery = await db.collection('numbers')
+      .orderBy('createdAt', 'desc')
+      .limit(30)
+      .get();
+    
+    const numbers = [];
+    numbersQuery.forEach(doc => {
+      numbers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Get users (first 30)
+    const usersQuery = await db.collection('users')
+      .orderBy('createdAt', 'desc')
+      .limit(30)
+      .get();
+    
+    const users = [];
+    usersQuery.forEach(doc => {
+      users.push({
+        id: doc.id,
+        email: doc.data().email,
+        balance: doc.data().balance || 0,
+        role: doc.data().role || 'user',
+        createdAt: doc.data().createdAt
+      });
+    });
+
+    // Get bulk prices
+    const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
+    let bulkPrices = {
+      normal_10: null,
+      normal_20: null,
+      id_10: null,
+      id_20: null,
+      id_50: null,
+      id_100: null
+    };
+    if (bulkPricesDoc.exists) {
+      bulkPrices = bulkPricesDoc.data();
+    }
+
+    res.json({
+      success: true,
+      totalUsers: counters.totalUsers || 0,
+      availableNumbers: counters.availableNumbers || 0,
+      soldNumbers: counters.soldNumbers || 0,
+      idAvailableNumbers: counters.idAvailableNumbers || 0,
+      idSoldNumbers: counters.idSoldNumbers || 0,
+      numbers,
+      users,
+      bulkPrices
+    });
+
+  } catch (error) {
+    console.error('Admin combined error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ==================== USER ENDPOINTS ====================
 
 // Get user dashboard data
@@ -263,20 +581,12 @@ app.post('/api/user/dashboard', async (req, res) => {
     
     const userData = userDoc.data();
     
-    const priceCountsSnapshot = await db.collection('priceCounts').get();
+    const priceCounts = await getCachedPriceCounts();
     
-    const priceList = [];
-    priceCountsSnapshot.forEach(doc => {
-      const data = doc.data();
-      if (data.availableCount > 0) {
-        priceList.push({
-          price: doc.id,
-          availableCount: data.availableCount
-        });
-      }
-    });
-    
-    priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
+    const priceList = Object.entries(priceCounts.normal)
+      .filter(([_, count]) => count > 0)
+      .map(([price, availableCount]) => ({ price, availableCount }))
+      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
     // Get bulk prices
     const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
@@ -550,6 +860,11 @@ app.post('/api/user/buy-number', async (req, res) => {
       };
     });
     
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
+    
     res.json({
       success: true,
       number: result.number,
@@ -668,6 +983,11 @@ app.post('/api/user/bulk-buy-number', async (req, res) => {
       };
     });
     
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
+    
     res.json({
       success: true,
       message: `${result.quantity} numbers purchased successfully for ${result.totalPrice} PKR`,
@@ -697,6 +1017,7 @@ app.post('/api/user/my-numbers', async (req, res) => {
       .where('status', '==', 'active')
       .where('type', '==', 'normal')
       .orderBy('purchasedAt', 'desc')
+      .limit(100)
       .get();
     
     const numbers = [];
@@ -793,33 +1114,12 @@ app.post('/api/user/id-dashboard', async (req, res) => {
     
     const userData = userDoc.data();
     
-    // FIX: Directly count available ID numbers by price
-    const idNumbersSnapshot = await db.collection('idNumbers')
-      .where('status', '==', 'available')
-      .get();
+    const priceCounts = await getCachedPriceCounts();
     
-    const priceMap = {};
-    idNumbersSnapshot.forEach(doc => {
-      const data = doc.data();
-      const price = data.price;
-      if (priceMap[price]) {
-        priceMap[price]++;
-      } else {
-        priceMap[price] = 1;
-      }
-    });
-    
-    const priceList = [];
-    for (const [price, count] of Object.entries(priceMap)) {
-      if (count > 0) {
-        priceList.push({
-          price: price,
-          availableCount: count
-        });
-      }
-    }
-    
-    priceList.sort((a, b) => parseInt(a.price) - parseInt(b.price));
+    const priceList = Object.entries(priceCounts.id)
+      .filter(([_, count]) => count > 0)
+      .map(([price, availableCount]) => ({ price, availableCount }))
+      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
     
     // Get bulk prices
     const bulkPricesDoc = await db.collection('settings').doc('bulkPrices').get();
@@ -925,6 +1225,11 @@ app.post('/api/user/buy-id-number', async (req, res) => {
         apiUrl: numberData.apiUrl
       };
     });
+    
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
     
     res.json({
       success: true,
@@ -1044,6 +1349,11 @@ app.post('/api/user/bulk-buy-id-number', async (req, res) => {
       };
     });
     
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
+    
     res.json({
       success: true,
       message: `${result.quantity} ID numbers purchased successfully for ${result.totalPrice} PKR`,
@@ -1073,6 +1383,7 @@ app.post('/api/user/my-id-numbers', async (req, res) => {
       .where('status', '==', 'active')
       .where('type', '==', 'id')
       .orderBy('purchasedAt', 'desc')
+      .limit(100)
       .get();
     
     const numbers = [];
@@ -1191,39 +1502,14 @@ app.post('/api/admin/dashboard', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const usersSnapshot = await db.collection('users').count().get();
-    const totalUsers = usersSnapshot.data().count || 0;
-    
-    const availableSnapshot = await db.collection('numbers')
-      .where('status', '==', 'available')
-      .count()
-      .get();
-    const availableNumbers = availableSnapshot.data().count || 0;
-    
-    const soldSnapshot = await db.collection('numbers')
-      .where('status', '==', 'sold')
-      .count()
-      .get();
-    const soldNumbers = soldSnapshot.data().count || 0;
-    
-    const idAvailableSnapshot = await db.collection('idNumbers')
-      .where('status', '==', 'available')
-      .count()
-      .get();
-    const idAvailableNumbers = idAvailableSnapshot.data().count || 0;
-    
-    const idSoldSnapshot = await db.collection('idNumbers')
-      .where('status', '==', 'sold')
-      .count()
-      .get();
-    const idSoldNumbers = idSoldSnapshot.data().count || 0;
+    const counters = await getCachedAdminCounters();
     
     res.json({
-      totalUsers,
-      availableNumbers,
-      soldNumbers,
-      idAvailableNumbers,
-      idSoldNumbers
+      totalUsers: counters.totalUsers || 0,
+      availableNumbers: counters.availableNumbers || 0,
+      soldNumbers: counters.soldNumbers || 0,
+      idAvailableNumbers: counters.idAvailableNumbers || 0,
+      idSoldNumbers: counters.idSoldNumbers || 0
     });
     
   } catch (error) {
@@ -1291,6 +1577,11 @@ app.post('/api/admin/add-numbers', async (req, res) => {
     }, { merge: true });
     
     await batch.commit();
+    
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
     
     res.json({
       success: true,
@@ -1377,6 +1668,11 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         await batch.commit();
       }
       
+      // Update admin counters
+      await updateAdminCounters();
+      // Invalidate cache
+      cache.timestamp = 0;
+      
       return res.json({
         success: true,
         message: `${deletedCount} sold numbers deleted`
@@ -1437,6 +1733,11 @@ app.post('/api/admin/delete-numbers', async (req, res) => {
         
         await batch.commit();
       }
+      
+      // Update admin counters
+      await updateAdminCounters();
+      // Invalidate cache
+      cache.timestamp = 0;
       
       return res.json({
         success: true,
@@ -1515,6 +1816,11 @@ app.post('/api/admin/add-id-numbers', async (req, res) => {
     }, { merge: true });
     
     await batch.commit();
+    
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
     
     res.json({
       success: true,
@@ -1604,6 +1910,11 @@ app.post('/api/admin/delete-id-numbers', async (req, res) => {
         await batch.commit();
       }
       
+      // Update admin counters
+      await updateAdminCounters();
+      // Invalidate cache
+      cache.timestamp = 0;
+      
       return res.json({
         success: true,
         message: `${deletedCount} sold ID numbers deleted`
@@ -1664,6 +1975,11 @@ app.post('/api/admin/delete-id-numbers', async (req, res) => {
         
         await batch.commit();
       }
+      
+      // Update admin counters
+      await updateAdminCounters();
+      // Invalidate cache
+      cache.timestamp = 0;
       
       return res.json({
         success: true,
@@ -1908,6 +2224,11 @@ app.post('/api/admin/delete-user', async (req, res) => {
       console.error('Auth deletion error:', authError);
     }
     
+    // Update admin counters
+    await updateAdminCounters();
+    // Invalidate cache
+    cache.timestamp = 0;
+    
     res.json({ success: true });
     
   } catch (error) {
@@ -1943,6 +2264,8 @@ app.get('/', (req, res) => {
       '/api/auth/signup',
       '/api/auth/login',
       '/api/admin/login',
+      '/api/user/combined-dashboard',
+      '/api/admin/combined-dashboard',
       '/api/user/dashboard',
       '/api/user/transfer-balance',
       '/api/user/transfer-history',
