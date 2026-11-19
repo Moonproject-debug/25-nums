@@ -1,4 +1,4 @@
-// index.js - USA Nums by Moon API (Secured v6.0.0)
+// index.js - USA Nums by Moon API (Secured v6.1.0)
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
@@ -48,30 +48,67 @@ app.use((req, res, next) => {
 });
 
 // ============================================
-// ✅ SECURITY: Rate limiters
+// ✅ SMART RATE LIMITERS (per-email/per-user, shared IP safe)
 // ============================================
+
+// Login: 5 failed attempts per EMAIL per 15 min (successful logins don't count)
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 20,
-  message: { error: 'Too many attempts. Please try again later.' },
-  standardHeaders: true, legacyHeaders: false,
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => {
+    const email = (req.body?.email || '').toLowerCase().trim();
+    return email ? `login_${email}_${req.ip}` : `login_${req.ip}`;
+  },
+  skipSuccessfulRequests: true,
+  message: { error: 'Too many failed login attempts for this account. Please wait 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
+// Signup: 5 attempts per EMAIL per hour (prevents enumeration)
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => {
+    const email = (req.body?.email || '').toLowerCase().trim();
+    return email ? `signup_${email}_${req.ip}` : `signup_${req.ip}`;
+  },
+  message: { error: 'Too many signup attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Admin login: 5 failed attempts per EMAIL per 15 min
 const adminLoginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 10,
-  message: { error: 'Too many admin login attempts. Please try again later.' },
-  standardHeaders: true, legacyHeaders: false,
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => {
+    const email = (req.body?.email || '').toLowerCase().trim();
+    return email ? `admin_${email}_${req.ip}` : `admin_${req.ip}`;
+  },
+  skipSuccessfulRequests: true,
+  message: { error: 'Too many admin login attempts. Please wait 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
+// Transfer: 20 per minute per IP (per-user 10/min enforced in-route)
 const transferLimiter = rateLimit({
-  windowMs: 60 * 1000, max: 10,
-  message: { error: 'Too many transfer attempts. Please wait a moment.' },
-  standardHeaders: true, legacyHeaders: false,
+  windowMs: 60 * 1000,
+  max: 20,
+  message: { error: 'Too many transfer requests. Please wait a moment.' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
+// General: 1000 per minute per IP (very generous — only blocks extreme abuse)
 const generalLimiter = rateLimit({
-  windowMs: 60 * 1000, max: 120,
+  windowMs: 60 * 1000,
+  max: 1000,
+  skipSuccessfulRequests: true,
   message: { error: 'Too many requests. Please slow down.' },
-  standardHeaders: true, legacyHeaders: false,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 // ============================================
@@ -95,6 +132,22 @@ try {
 
 const db = admin.firestore();
 const auth = admin.auth();
+
+// ============================================
+// Per-user transfer rate limit (in-memory)
+// ============================================
+const transferCounts = new Map();
+
+function checkUserTransferLimit(uid) {
+  const now = Date.now();
+  const key = `transfer_${uid}`;
+  let arr = transferCounts.get(key) || [];
+  arr = arr.filter(t => now - t < 60000);
+  if (arr.length >= 10) return false;
+  arr.push(now);
+  transferCounts.set(key, arr);
+  return true;
+}
 
 // ============================================
 // Cache system (unchanged)
@@ -198,7 +251,7 @@ async function verifyToken(req, res, next) {
 // ============================================
 
 // User Signup
-app.post('/api/auth/signup', authLimiter, async (req, res) => {
+app.post('/api/auth/signup', signupLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -229,7 +282,7 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
 
     await updateAdminCounters();
 
-    // ✅ Get ID token for immediate login
+    // Auto-login after signup
     let idToken = null, refreshToken = null;
     try {
       const fetch = (await import('node-fetch')).default;
@@ -267,14 +320,12 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      // ✅ SECURITY: Generic error (prevent enumeration)
       if (data.error?.message === 'QUOTA_EXCEEDED') {
         return res.status(429).json({ error: 'Too many login attempts. Please wait 1 hour.' });
       }
       return res.status(400).json({ error: 'Invalid email or password' });
     }
 
-    // Ensure user doc exists
     const userDoc = await db.collection('users').doc(data.localId).get();
     if (!userDoc.exists) {
       await db.collection('users').doc(data.localId).set({
@@ -300,7 +351,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// ✅ NEW: Token Refresh
+// Token Refresh
 app.post('/api/auth/refresh', authLimiter, async (req, res) => {
   try {
     const { refreshToken } = req.body;
@@ -327,7 +378,7 @@ app.post('/api/auth/refresh', authLimiter, async (req, res) => {
   }
 });
 
-// Admin Login (uses admin-token header)
+// Admin Login
 app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -337,7 +388,7 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Email, password and admin token required' });
     }
     if (adminToken !== process.env.ADMIN_SECRET_TOKEN) {
-      return res.status(401).json({ error: 'Invalid credentials' }); // ✅ generic
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const fetch = (await import('node-fetch')).default;
@@ -350,7 +401,6 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      // ✅ SECURITY: generic error
       return res.status(400).json({ error: 'Invalid credentials' });
     }
 
@@ -376,7 +426,7 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
 // User Dashboard
 app.post('/api/user/dashboard', generalLimiter, verifyToken, async (req, res) => {
   try {
-    const userId = req.uid; // ✅ TOKEN se, body se NAHI
+    const userId = req.uid;
     const userDoc = await db.collection('users').doc(userId).get();
     if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
     const userData = userDoc.data();
@@ -454,11 +504,16 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
   }
 });
 
-// ✅ SECURITY: Transfer Balance — Sender from token, both directions block admin
+// Transfer Balance (token + per-user + both directions block admin)
 app.post('/api/user/transfer-balance', transferLimiter, verifyToken, async (req, res) => {
   try {
-    const senderUid = req.uid; // ✅ token se
+    const senderUid = req.uid;
     const { recipientEmail, amount } = req.body;
+
+    // ✅ Per-user rate limit (10/min)
+    if (!checkUserTransferLimit(senderUid)) {
+      return res.status(429).json({ error: 'Too many transfers. Please wait 1 minute.' });
+    }
 
     if (!recipientEmail || typeof recipientEmail !== 'string') {
       return res.status(400).json({ error: 'Recipient email required' });
@@ -472,17 +527,14 @@ app.post('/api/user/transfer-balance', transferLimiter, verifyToken, async (req,
     if (!senderDoc.exists) return res.status(404).json({ error: 'Sender not found' });
     const senderData = senderDoc.data();
 
-    // ✅ Block admin as sender
     if (senderData.role === 'admin') return res.status(403).json({ error: 'Admin accounts cannot use this endpoint' });
 
-    // Self-transfer
     if (senderData.email.toLowerCase() === recipientEmail.toLowerCase().trim()) {
       return res.status(400).json({ error: 'Cannot transfer to yourself' });
     }
 
     if ((senderData.balance || 0) < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // Find recipient
     const recipientSnapshot = await db.collection('users')
       .where('email', '==', recipientEmail.toLowerCase().trim()).limit(1).get();
     if (recipientSnapshot.empty) return res.status(404).json({ error: 'Recipient user not found' });
@@ -491,7 +543,6 @@ app.post('/api/user/transfer-balance', transferLimiter, verifyToken, async (req,
     const recipientId = recipientDoc.id;
     const recipientData = recipientDoc.data();
 
-    // ✅ Block admin as recipient
     if (recipientData.role === 'admin') return res.status(400).json({ error: 'Cannot transfer to admin account' });
 
     await db.runTransaction(async (transaction) => {
@@ -566,7 +617,7 @@ app.post('/api/user/transfer-history', generalLimiter, verifyToken, async (req, 
 // Buy Number
 app.post('/api/user/buy-number', generalLimiter, verifyToken, async (req, res) => {
   try {
-    const userId = req.uid; // ✅
+    const userId = req.uid;
     const { price } = req.body;
     if (!price) return res.status(400).json({ error: 'Price required' });
     const priceStr = price.toString();
@@ -703,7 +754,7 @@ app.post('/api/user/my-numbers', generalLimiter, verifyToken, async (req, res) =
   }
 });
 
-// Delete Number (ownership automatic via path)
+// Delete Number
 app.post('/api/user/delete-number', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -712,7 +763,7 @@ app.post('/api/user/delete-number', generalLimiter, verifyToken, async (req, res
 
     const numberRef = db.collection('users').doc(userId).collection('purchased').doc(numberId);
     const numberDoc = await numberRef.get();
-    if (!numberDoc.exists) return res.status(404).json({ error: 'Number not found' }); // ✅ ownership check via path
+    if (!numberDoc.exists) return res.status(404).json({ error: 'Number not found' });
 
     await numberRef.update({ status: 'deleted', deletedAt: admin.firestore.FieldValue.serverTimestamp() });
     res.json({ success: true });
@@ -949,7 +1000,7 @@ app.post('/api/user/delete-id-numbers', generalLimiter, verifyToken, async (req,
 });
 
 // ============================================
-// ✅ SECURITY: Proxy — auth + whitelist
+// Proxy — auth + whitelist
 // ============================================
 const PROXY_ALLOWED_HOSTS = [
   'moon-usa-physical-number.vercel.app',
@@ -986,7 +1037,7 @@ app.post('/api/proxy', generalLimiter, verifyToken, async (req, res) => {
 });
 
 // ============================================
-// ==================== ADMIN ENDPOINTS (admin-token required) ====================
+// ==================== ADMIN ENDPOINTS ====================
 // ============================================
 
 function requireAdminToken(req, res, next) {
@@ -1432,12 +1483,12 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/version', (req, res) => {
-  res.json({ version: '6.0.0', timestamp: Date.now() });
+  res.json({ version: '6.1.0', timestamp: Date.now() });
 });
 
-// ✅ SECURITY: Root endpoint — minimal info (no endpoint list)
+// Root endpoint (minimal)
 app.get('/', (req, res) => {
-  res.json({ message: 'USA Nums by Moon API', version: '6.0.0' });
+  res.json({ message: 'USA Nums by Moon API', version: '6.1.0' });
 });
 
 // 404
