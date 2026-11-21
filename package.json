@@ -1,7 +1,7 @@
 {
   "name": "usa-nums-backend",
-  "version": "1.0.0",
-  "description": "Backend for USA Nums by Moon - SMS Number Service",
+  "version": "7.0.0",
+  "description": "Backend for USA Nums by Moon - SMS Number Service (v7.0.0)",
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js",
@@ -21,6 +21,6 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": "26.x"
+    "node": "20.x"
   }
 }
