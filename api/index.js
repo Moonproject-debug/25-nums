@@ -1,16 +1,19 @@
 // ============================================
-// USA Nums by Moon — Backend API v7.0.0
+// USA Nums by Moon — Backend API v7.0.1
 // ============================================
-// Updates in this build (v7.0.0):
-// - Added: UK TikTok accounts (buy, admin add/manage/delete, counters, cache)
-// - Fixed: buy-fb-id now creates order doc + orderCount + purchased subcollection
-// - Updated: buy-gmail now saves to purchased subcollection (for dashboard display)
-// - Updated: combined-dashboard now returns myGmails, myFbIds, myTiktokAccounts,
-//            tiktokPriceList — all in ONE call (no extra endpoint)
-// - Added: delete-purchased endpoint (gmail/fbid/tiktok soft-delete)
-// - Updated: admin dashboards show tiktokAvailable + tiktokSold
-// - Preserved: 60s cache, incremental counters, transactions, single-write pattern
-// - No change to: rate limiters, auth flow, existing endpoints, order numbering
+// Updates in this build (v7.0.1):
+// - FIXED: totalUsers counter stuck
+//     * increment on signup (new account)
+//     * increment on login when user doc is created for the first time
+//     * incrementCounters now bumps `updatedAt` so freshness check works
+//     * getCachedAdminCounters auto-recomputes from live data if meta doc is
+//       stale (>10 min) or missing required fields (fixes historical drift)
+// - FIXED: manage-gmails / manage-fb-ids / manage-tiktok / list-coupons 500
+//     * Root cause: Firestore composite indexes missing for
+//       where(...)+orderBy(createdAt) combos
+//     * Solution: switched to in-memory filter + sort + paginate
+//       (no composite index required, works on any project out-of-the-box)
+// - Preserved: all other endpoints, rate limiters, auth, caches, proxy
 // ============================================
 
 const express = require('express');
@@ -171,7 +174,7 @@ function checkUserTransferLimit(uid) {
 }
 
 // ============================================
-// Cache system (extended with tiktok)
+// Cache system
 // ============================================
 let cache = {
   priceCounts: null,
@@ -183,6 +186,7 @@ let cache = {
   timestamp: 0
 };
 const CACHE_TTL = 60000;
+const COUNTERS_FRESHNESS_MS = 10 * 60 * 1000; // 10 minutes
 
 function cacheValid() {
   return cache.priceCounts && cache.idPriceCounts && cache.gmailPriceCounts &&
@@ -241,6 +245,7 @@ async function getCachedAllPrices() {
   return { normal, id, gmail, fbId, tiktok };
 }
 
+// ✅ FIXED: freshness + schema check so totalUsers drift auto-heals
 async function getCachedAdminCounters() {
   const now = Date.now();
   if (cache.adminCounters && (now - cache.timestamp) < CACHE_TTL) {
@@ -250,12 +255,25 @@ async function getCachedAdminCounters() {
   const countersDoc = await db.collection('meta').doc('counters').get();
   if (countersDoc.exists) {
     const data = countersDoc.data();
-    cache.adminCounters = data;
-    cache.timestamp = now;
-    return data;
+    const requiredKeys = [
+      'totalUsers', 'availableNumbers', 'soldNumbers',
+      'idAvailableNumbers', 'idSoldNumbers',
+      'gmailAvailable', 'gmailSold',
+      'fbIdsAvailable', 'fbIdsSold',
+      'tiktokAvailable', 'tiktokSold'
+    ];
+    const hasAllKeys = requiredKeys.every(k => typeof data[k] === 'number');
+    const tooOld = (now - (data.updatedAt || 0)) > COUNTERS_FRESHNESS_MS;
+
+    if (hasAllKeys && !tooOld) {
+      cache.adminCounters = data;
+      cache.timestamp = now;
+      return data;
+    }
+    // stale or partial → recompute
   }
 
-  // Rebuild
+  // Rebuild from live counts
   return await updateAdminCounters();
 }
 
@@ -300,14 +318,65 @@ async function updateAdminCounters() {
   return counters;
 }
 
-// ✅ Incremental counter update (1 write instead of 11 reads)
+// ✅ FIXED: bump updatedAt so freshness check works after increments
 async function incrementCounters(deltas) {
   try {
-    await db.collection('meta').doc('counters').set(deltas, { merge: true });
-    cache.adminCounters = null; // Invalidate cache
+    await db.collection('meta').doc('counters').set(
+      { ...deltas, updatedAt: Date.now() },
+      { merge: true }
+    );
+    cache.adminCounters = null;
   } catch (e) {
     console.error('Counter increment error:', e);
   }
+}
+
+// ============================================
+// ✅ NEW HELPER: in-memory filter + sort + paginate
+// (avoids missing Firestore composite indexes)
+// ============================================
+async function fetchAllAndPaginate(collectionName, filterFn, lastDocId, pageLimit) {
+  const CHUNK = 500;
+  const MAX_TOTAL = 20000;
+  const allDocs = [];
+  let lastSnap = null;
+
+  while (allDocs.length < MAX_TOTAL) {
+    let q = db.collection(collectionName).limit(CHUNK);
+    if (lastSnap) q = q.startAfter(lastSnap);
+    const snap = await q.get();
+    if (snap.empty) break;
+    snap.forEach(doc => allDocs.push(doc));
+    lastSnap = snap.docs[snap.docs.length - 1];
+    if (snap.size < CHUNK) break;
+  }
+
+  const getMs = (t) => {
+    if (!t) return 0;
+    if (typeof t.toMillis === 'function') return t.toMillis();
+    if (typeof t === 'number') return t;
+    if (t && typeof t === 'object' && t._seconds) return t._seconds * 1000;
+    return 0;
+  };
+
+  const filtered = filterFn ? allDocs.filter(doc => filterFn(doc.data())) : allDocs;
+  filtered.sort((a, b) => getMs(b.data().createdAt) - getMs(a.data().createdAt));
+
+  let startIdx = 0;
+  if (lastDocId) {
+    const idx = filtered.findIndex(d => d.id === lastDocId);
+    if (idx >= 0) startIdx = idx + 1;
+  }
+
+  const pageDocs = filtered.slice(startIdx, startIdx + pageLimit);
+  const hasMore = (startIdx + pageLimit) < filtered.length;
+  const lastId = pageDocs.length > 0 ? pageDocs[pageDocs.length - 1].id : null;
+
+  return {
+    docs: pageDocs.map(d => ({ id: d.id, ...d.data() })),
+    lastDocId: lastId,
+    hasMore
+  };
 }
 
 // ============================================
@@ -393,6 +462,9 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+    // ✅ FIXED: increment totalUsers
+    await incrementCounters({ totalUsers: admin.firestore.FieldValue.increment(1) });
+
     // Auto-login
     let idToken = null, refreshToken = null;
     try {
@@ -444,6 +516,9 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         orderCount: 0,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
+
+      // ✅ FIXED: increment totalUsers when creating user doc for the first time
+      await incrementCounters({ totalUsers: admin.firestore.FieldValue.increment(1) });
     }
 
     res.json({
@@ -580,13 +655,11 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
     const myIdNumbers = [];
     idPurchased.forEach(doc => myIdNumbers.push({ id: doc.id, ...doc.data() }));
 
-    // NEW: purchased gmails
     const gmailsPurchased = await db.collection('users').doc(userId).collection('purchased')
       .where('status', '==', 'active').where('type', '==', 'gmail').orderBy('purchasedAt', 'desc').get();
     const myGmails = [];
     gmailsPurchased.forEach(doc => myGmails.push({ id: doc.id, ...doc.data() }));
 
-    // NEW: purchased FB IDs (simple + marketplace combined)
     const [fbSimplePurchased, fbMarketPurchased] = await Promise.all([
       db.collection('users').doc(userId).collection('purchased')
         .where('status', '==', 'active').where('type', '==', 'fb_simple').orderBy('purchasedAt', 'desc').get(),
@@ -597,7 +670,6 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
     fbSimplePurchased.forEach(doc => myFbIds.push({ id: doc.id, ...doc.data() }));
     fbMarketPurchased.forEach(doc => myFbIds.push({ id: doc.id, ...doc.data() }));
 
-    // NEW: purchased TikTok accounts
     const tiktokPurchased = await db.collection('users').doc(userId).collection('purchased')
       .where('status', '==', 'active').where('type', '==', 'tiktok').orderBy('purchasedAt', 'desc').get();
     const myTiktokAccounts = [];
@@ -641,9 +713,7 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
   }
 });
 
-// ============================================
-// Multi-quantity buy numbers (unchanged)
-// ============================================
+// Multi-quantity buy numbers
 app.post('/api/user/buy-numbers', buyLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -812,9 +882,7 @@ app.post('/api/user/buy-numbers', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// ============================================
-// Buy Gmails — NOW saves to purchased subcollection
-// ============================================
+// Buy Gmails
 app.post('/api/user/buy-gmail', buyLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -862,7 +930,6 @@ app.post('/api/user/buy-gmail', buyLimiter, verifyToken, async (req, res) => {
           soldAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // NEW: save to purchased subcollection
         const purchasedRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
         transaction.set(purchasedRef, {
           gmail: gmailData.gmail,
@@ -945,9 +1012,7 @@ app.post('/api/user/buy-gmail', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// ============================================
-// Buy FB IDs — FIXED: order + orderCount + purchased subcollection
-// ============================================
+// Buy FB IDs
 app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1001,7 +1066,6 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
           soldAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // NEW: save to purchased subcollection
         const purchasedRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
         transaction.set(purchasedRef, {
           uid: fbData.uid,
@@ -1030,7 +1094,6 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
         soldCount: admin.firestore.FieldValue.increment(quantity)
       }, { merge: true });
 
-      // FIX: orderCount + order doc (previously missing)
       const currentOrderCount = userData.orderCount || 0;
       const newOrderNumber = currentOrderCount + 1;
 
@@ -1089,9 +1152,7 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// ============================================
-// ✅ NEW: Buy UK TikTok Accounts
-// ============================================
+// Buy UK TikTok Accounts
 app.post('/api/user/buy-tiktok', buyLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1225,9 +1286,7 @@ app.post('/api/user/buy-tiktok', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// ============================================
-// ✅ NEW: Delete purchased items (gmail/fbid/tiktok)
-// ============================================
+// Delete purchased items (gmail/fbid/tiktok)
 app.post('/api/user/delete-purchased', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1266,9 +1325,7 @@ app.post('/api/user/delete-purchased', generalLimiter, verifyToken, async (req, 
   }
 });
 
-// ============================================
-// Apply coupon (validate only) — unchanged
-// ============================================
+// Apply coupon (validate only)
 app.post('/api/user/apply-coupon', generalLimiter, verifyToken, async (req, res) => {
   try {
     const { couponCode, type } = req.body;
@@ -1309,9 +1366,7 @@ app.post('/api/user/apply-coupon', generalLimiter, verifyToken, async (req, res)
   }
 });
 
-// ============================================
-// History (paginated) — unchanged
-// ============================================
+// History (paginated)
 app.post('/api/user/history', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1361,9 +1416,7 @@ app.post('/api/user/history', generalLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// ============================================
-// My Orders (paginated) — unchanged
-// ============================================
+// My Orders (paginated)
 app.post('/api/user/my-orders', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1419,9 +1472,7 @@ app.post('/api/user/my-orders', generalLimiter, verifyToken, async (req, res) =>
   }
 });
 
-// ============================================
-// Change Password — unchanged
-// ============================================
+// Change Password
 app.post('/api/user/change-password', passwordChangeLimiter, verifyToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -1459,9 +1510,7 @@ app.post('/api/user/change-password', passwordChangeLimiter, verifyToken, async 
   }
 });
 
-// ============================================
-// Transfer Balance — unchanged
-// ============================================
+// Transfer Balance
 app.post('/api/user/transfer-balance', transferLimiter, verifyToken, async (req, res) => {
   try {
     const senderUid = req.uid;
@@ -1561,7 +1610,7 @@ app.post('/api/user/transfer-balance', transferLimiter, verifyToken, async (req,
   }
 });
 
-// Transfer History — unchanged
+// Transfer History
 app.post('/api/user/transfer-history', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1587,7 +1636,7 @@ app.post('/api/user/transfer-history', generalLimiter, verifyToken, async (req, 
   }
 });
 
-// My Numbers — unchanged
+// My Numbers
 app.post('/api/user/my-numbers', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1602,7 +1651,7 @@ app.post('/api/user/my-numbers', generalLimiter, verifyToken, async (req, res) =
   }
 });
 
-// Delete Number — unchanged
+// Delete Number
 app.post('/api/user/delete-number', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1621,7 +1670,7 @@ app.post('/api/user/delete-number', generalLimiter, verifyToken, async (req, res
   }
 });
 
-// Delete Numbers — unchanged
+// Delete Numbers
 app.post('/api/user/delete-numbers', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1644,7 +1693,7 @@ app.post('/api/user/delete-numbers', generalLimiter, verifyToken, async (req, re
   }
 });
 
-// My ID Numbers — unchanged
+// My ID Numbers
 app.post('/api/user/my-id-numbers', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1659,7 +1708,7 @@ app.post('/api/user/my-id-numbers', generalLimiter, verifyToken, async (req, res
   }
 });
 
-// Delete ID Number — unchanged
+// Delete ID Number
 app.post('/api/user/delete-id-number', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1678,7 +1727,7 @@ app.post('/api/user/delete-id-number', generalLimiter, verifyToken, async (req, 
   }
 });
 
-// Delete ID Numbers — unchanged
+// Delete ID Numbers
 app.post('/api/user/delete-id-numbers', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1702,7 +1751,7 @@ app.post('/api/user/delete-id-numbers', generalLimiter, verifyToken, async (req,
 });
 
 // ============================================
-// Proxy — unchanged
+// Proxy
 // ============================================
 const PROXY_ALLOWED_HOSTS = [
   'moon-usa-physical-number.vercel.app',
@@ -1741,7 +1790,7 @@ app.post('/api/proxy', generalLimiter, verifyToken, async (req, res) => {
 // ==================== ADMIN ENDPOINTS ====================
 // ============================================
 
-// Admin Combined Dashboard (now with tiktok stats)
+// Admin Combined Dashboard
 app.post('/api/admin/combined-dashboard', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const counters = await getCachedAdminCounters();
@@ -1777,7 +1826,7 @@ app.post('/api/admin/combined-dashboard', generalLimiter, requireAdminToken, asy
   }
 });
 
-// Admin Dashboard Stats (now with tiktok)
+// Admin Dashboard Stats
 app.post('/api/admin/dashboard', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const counters = await getCachedAdminCounters();
@@ -1800,7 +1849,7 @@ app.post('/api/admin/dashboard', generalLimiter, requireAdminToken, async (req, 
   }
 });
 
-// Recompute counters — unchanged
+// Recompute counters
 app.post('/api/admin/recompute-counters', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const counters = await updateAdminCounters();
@@ -1811,9 +1860,7 @@ app.post('/api/admin/recompute-counters', generalLimiter, requireAdminToken, asy
   }
 });
 
-// ============================================
-// Admin: Add Numbers (Verification) — unchanged
-// ============================================
+// Admin: Add Numbers (Verification)
 app.post('/api/admin/add-numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { numbersText, price } = req.body;
@@ -1857,7 +1904,7 @@ app.post('/api/admin/add-numbers', generalLimiter, requireAdminToken, async (req
   }
 });
 
-// Get Numbers (paginated) — unchanged
+// Get Numbers (paginated)
 app.post('/api/admin/numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId } = req.body;
@@ -1878,7 +1925,7 @@ app.post('/api/admin/numbers', generalLimiter, requireAdminToken, async (req, re
   }
 });
 
-// Delete Numbers — unchanged
+// Delete Numbers
 app.post('/api/admin/delete-numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -1942,9 +1989,7 @@ app.post('/api/admin/delete-numbers', generalLimiter, requireAdminToken, async (
   }
 });
 
-// ============================================
-// Admin: Add ID Numbers — unchanged
-// ============================================
+// Admin: Add ID Numbers
 app.post('/api/admin/add-id-numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { numbersText, price } = req.body;
@@ -1988,7 +2033,7 @@ app.post('/api/admin/add-id-numbers', generalLimiter, requireAdminToken, async (
   }
 });
 
-// Get ID Numbers — unchanged
+// Get ID Numbers
 app.post('/api/admin/id-numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId, limit } = req.body;
@@ -2010,7 +2055,7 @@ app.post('/api/admin/id-numbers', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// Delete ID Numbers — unchanged
+// Delete ID Numbers
 app.post('/api/admin/delete-id-numbers', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { numberIds, deleteAllSold } = req.body;
@@ -2074,9 +2119,7 @@ app.post('/api/admin/delete-id-numbers', generalLimiter, requireAdminToken, asyn
   }
 });
 
-// ============================================
-// Admin: Add Gmails — unchanged
-// ============================================
+// Admin: Add Gmails
 app.post('/api/admin/add-gmails', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { gmailsText, price } = req.body;
@@ -2120,41 +2163,37 @@ app.post('/api/admin/add-gmails', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// Manage Gmails — unchanged
+// ✅ FIXED: Manage Gmails — in-memory filter + sort + paginate
 app.post('/api/admin/manage-gmails', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId, limit } = req.body;
     const pageLimit = limit || 50;
-    let query = db.collection('gmails').orderBy('createdAt', 'desc').limit(pageLimit);
-    if (status && status !== 'all') query = query.where('status', '==', status);
-    if (lastDocId) {
-      const lastDoc = await db.collection('gmails').doc(lastDocId).get();
-      if (lastDoc.exists) query = query.startAfter(lastDoc);
-    }
-    const snapshot = await query.get();
-    const gmails = [];
-    let lastId = null;
-    snapshot.forEach(doc => {
-      const d = doc.data();
-      gmails.push({
-        id: doc.id,
-        gmail: d.gmail,
-        password: d.status === 'sold' ? '••••••••' : d.password,
-        price: d.price,
-        status: d.status,
-        soldTo: d.soldTo || null,
-        createdAt: d.createdAt
-      });
-      lastId = doc.id;
-    });
-    res.json({ gmails, lastDocId: lastId, hasMore: gmails.length === pageLimit });
+
+    const filterFn = (d) => {
+      if (status && status !== 'all' && d.status !== status) return false;
+      return true;
+    };
+
+    const result = await fetchAllAndPaginate('gmails', filterFn, lastDocId, pageLimit);
+
+    const gmails = result.docs.map(d => ({
+      id: d.id,
+      gmail: d.gmail,
+      password: d.status === 'sold' ? '••••••••' : d.password,
+      price: d.price,
+      status: d.status,
+      soldTo: d.soldTo || null,
+      createdAt: d.createdAt
+    }));
+
+    res.json({ gmails, lastDocId: result.lastDocId, hasMore: result.hasMore });
   } catch (error) {
     console.error('Manage gmails error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Delete Gmails — unchanged
+// Delete Gmails
 app.post('/api/admin/delete-gmails', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { gmailIds, deleteAllSold } = req.body;
@@ -2213,9 +2252,7 @@ app.post('/api/admin/delete-gmails', generalLimiter, requireAdminToken, async (r
   }
 });
 
-// ============================================
-// Admin: Add FB IDs — unchanged
-// ============================================
+// Admin: Add FB IDs
 app.post('/api/admin/add-fb-ids', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { fbIdsText, price, type } = req.body;
@@ -2266,44 +2303,40 @@ app.post('/api/admin/add-fb-ids', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// Manage FB IDs — unchanged
+// ✅ FIXED: Manage FB IDs — in-memory filter + sort + paginate
 app.post('/api/admin/manage-fb-ids', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, type, lastDocId, limit } = req.body;
     const pageLimit = limit || 50;
-    let query = db.collection('fbIds').orderBy('createdAt', 'desc').limit(pageLimit);
-    if (status && status !== 'all') query = query.where('status', '==', status);
-    if (type && type !== 'all') query = query.where('type', '==', type);
-    if (lastDocId) {
-      const lastDoc = await db.collection('fbIds').doc(lastDocId).get();
-      if (lastDoc.exists) query = query.startAfter(lastDoc);
-    }
-    const snapshot = await query.get();
-    const fbIds = [];
-    let lastId = null;
-    snapshot.forEach(doc => {
-      const d = doc.data();
-      fbIds.push({
-        id: doc.id,
-        uid: d.uid,
-        password: d.status === 'sold' ? '••••••••' : d.password,
-        twoFA: d.status === 'sold' ? (d.twoFA ? '••••' : '') : (d.twoFA || ''),
-        type: d.type,
-        price: d.price,
-        status: d.status,
-        soldTo: d.soldTo || null,
-        createdAt: d.createdAt
-      });
-      lastId = doc.id;
-    });
-    res.json({ fbIds, lastDocId: lastId, hasMore: fbIds.length === pageLimit });
+
+    const filterFn = (d) => {
+      if (status && status !== 'all' && d.status !== status) return false;
+      if (type && type !== 'all' && d.type !== type) return false;
+      return true;
+    };
+
+    const result = await fetchAllAndPaginate('fbIds', filterFn, lastDocId, pageLimit);
+
+    const fbIds = result.docs.map(d => ({
+      id: d.id,
+      uid: d.uid,
+      password: d.status === 'sold' ? '••••••••' : d.password,
+      twoFA: d.status === 'sold' ? (d.twoFA ? '••••' : '') : (d.twoFA || ''),
+      type: d.type,
+      price: d.price,
+      status: d.status,
+      soldTo: d.soldTo || null,
+      createdAt: d.createdAt
+    }));
+
+    res.json({ fbIds, lastDocId: result.lastDocId, hasMore: result.hasMore });
   } catch (error) {
     console.error('Manage fb ids error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Delete FB IDs — unchanged
+// Delete FB IDs
 app.post('/api/admin/delete-fb-ids', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { fbIdIds, deleteAllSold } = req.body;
@@ -2362,10 +2395,7 @@ app.post('/api/admin/delete-fb-ids', generalLimiter, requireAdminToken, async (r
   }
 });
 
-// ============================================
-// ✅ NEW Admin: Add UK TikTok Accounts
-// Format: gmail|gmailPassword|tiktokGmail|tiktokPassword
-// ============================================
+// Admin: Add UK TikTok Accounts
 app.post('/api/admin/add-tiktok', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { tiktokText, price } = req.body;
@@ -2413,25 +2443,23 @@ app.post('/api/admin/add-tiktok', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// Manage TikTok — list
+// ✅ FIXED: Manage TikTok — in-memory filter + sort + paginate
 app.post('/api/admin/manage-tiktok', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId, limit } = req.body;
     const pageLimit = limit || 50;
-    let query = db.collection('tiktokAccounts').orderBy('createdAt', 'desc').limit(pageLimit);
-    if (status && status !== 'all') query = query.where('status', '==', status);
-    if (lastDocId) {
-      const lastDoc = await db.collection('tiktokAccounts').doc(lastDocId).get();
-      if (lastDoc.exists) query = query.startAfter(lastDoc);
-    }
-    const snapshot = await query.get();
-    const accounts = [];
-    let lastId = null;
-    snapshot.forEach(doc => {
-      const d = doc.data();
+
+    const filterFn = (d) => {
+      if (status && status !== 'all' && d.status !== status) return false;
+      return true;
+    };
+
+    const result = await fetchAllAndPaginate('tiktokAccounts', filterFn, lastDocId, pageLimit);
+
+    const accounts = result.docs.map(d => {
       const sold = d.status === 'sold';
-      accounts.push({
-        id: doc.id,
+      return {
+        id: d.id,
         gmail: d.gmail,
         gmailPassword: sold ? '••••••••' : d.gmailPassword,
         tiktokGmail: d.tiktokGmail,
@@ -2440,17 +2468,17 @@ app.post('/api/admin/manage-tiktok', generalLimiter, requireAdminToken, async (r
         status: d.status,
         soldTo: d.soldTo || null,
         createdAt: d.createdAt
-      });
-      lastId = doc.id;
+      };
     });
-    res.json({ accounts, lastDocId: lastId, hasMore: accounts.length === pageLimit });
+
+    res.json({ accounts, lastDocId: result.lastDocId, hasMore: result.hasMore });
   } catch (error) {
     console.error('Manage tiktok error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Delete TikTok — bulk or specific
+// Delete TikTok
 app.post('/api/admin/delete-tiktok', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { tiktokIds, deleteAllSold } = req.body;
@@ -2509,9 +2537,7 @@ app.post('/api/admin/delete-tiktok', generalLimiter, requireAdminToken, async (r
   }
 });
 
-// ============================================
-// Admin: Generate Coupons — unchanged
-// ============================================
+// Admin: Generate Coupons
 app.post('/api/admin/generate-coupons', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { count, discountPerNumber, type } = req.body;
@@ -2576,53 +2602,41 @@ app.post('/api/admin/generate-coupons', generalLimiter, requireAdminToken, async
   }
 });
 
-// List Coupons — unchanged
+// ✅ FIXED: List Coupons — in-memory filter + sort + paginate
 app.post('/api/admin/list-coupons', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, type, lastDocId, limit } = req.body;
     const pageLimit = limit || 100;
 
-    let query = db.collection('coupons').orderBy('createdAt', 'desc').limit(pageLimit);
-    if (type && type !== 'all') query = query.where('type', '==', type);
+    const filterFn = (d) => {
+      if (type && type !== 'all' && d.type !== type) return false;
+      const uses = d.totalUses || 0;
+      if (status === 'used' && uses === 0) return false;
+      if (status === 'unused' && uses > 0) return false;
+      return true;
+    };
 
-    if (status === 'used') {
-      query = query.where('totalUses', '>', 0);
-    } else if (status === 'unused') {
-      query = query.where('totalUses', '==', 0);
-    }
+    const result = await fetchAllAndPaginate('coupons', filterFn, lastDocId, pageLimit);
 
-    if (lastDocId) {
-      const lastDoc = await db.collection('coupons').doc(lastDocId).get();
-      if (lastDoc.exists) query = query.startAfter(lastDoc);
-    }
+    const coupons = result.docs.map(d => ({
+      id: d.id,
+      code: d.code,
+      discountPerNumber: d.discountPerNumber,
+      type: d.type,
+      usedBy: d.usedBy || null,
+      usedAt: d.usedAt || null,
+      totalUses: d.totalUses || 0,
+      createdAt: d.createdAt
+    }));
 
-    const snapshot = await query.get();
-    const coupons = [];
-    let lastId = null;
-
-    snapshot.forEach(doc => {
-      const d = doc.data();
-      coupons.push({
-        id: doc.id,
-        code: d.code,
-        discountPerNumber: d.discountPerNumber,
-        type: d.type,
-        usedBy: d.usedBy || null,
-        usedAt: d.usedAt || null,
-        totalUses: d.totalUses || 0,
-        createdAt: d.createdAt
-      });
-      lastId = doc.id;
-    });
-
-    res.json({ coupons, lastDocId: lastId, hasMore: coupons.length === pageLimit });
+    res.json({ coupons, lastDocId: result.lastDocId, hasMore: result.hasMore });
   } catch (error) {
     console.error('List coupons error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Delete Coupons — unchanged
+// Delete Coupons
 app.post('/api/admin/delete-coupons', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { couponCodes, deleteAllUsed } = req.body;
@@ -2659,9 +2673,7 @@ app.post('/api/admin/delete-coupons', generalLimiter, requireAdminToken, async (
   }
 });
 
-// ============================================
-// Admin: Add Balance — unchanged
-// ============================================
+// Admin: Add Balance
 app.post('/api/admin/add-balance', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { email, amount } = req.body;
@@ -2709,9 +2721,7 @@ app.post('/api/admin/add-balance', generalLimiter, requireAdminToken, async (req
   }
 });
 
-// ============================================
-// Admin: Users — unchanged
-// ============================================
+// Admin: Users
 app.post('/api/admin/users', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { lastDocId, searchEmail } = req.body;
@@ -2746,7 +2756,7 @@ app.post('/api/admin/users', generalLimiter, requireAdminToken, async (req, res)
   }
 });
 
-// Update User Balance — unchanged
+// Update User Balance
 app.post('/api/admin/update-user-balance', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { userId, newBalance } = req.body;
@@ -2760,7 +2770,7 @@ app.post('/api/admin/update-user-balance', generalLimiter, requireAdminToken, as
   }
 });
 
-// Delete User — unchanged (purchased subcollection already handled)
+// Delete User
 app.post('/api/admin/delete-user', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { userId } = req.body;
@@ -2781,6 +2791,7 @@ app.post('/api/admin/delete-user', generalLimiter, requireAdminToken, async (req
 
     try { await auth.deleteUser(userId); } catch (authError) { console.error('Auth deletion error:', authError); }
 
+    // ✅ Recompute all counters (includes totalUsers correctly)
     await updateAdminCounters();
     cache.timestamp = 0;
     res.json({ success: true });
@@ -2798,16 +2809,16 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     firebase: admin.apps.length > 0 ? 'connected' : 'disconnected',
-    version: '7.0.0'
+    version: '7.0.1'
   });
 });
 
 app.get('/api/version', (req, res) => {
-  res.json({ version: '7.0.0', timestamp: Date.now() });
+  res.json({ version: '7.0.1', timestamp: Date.now() });
 });
 
 app.get('/', (req, res) => {
-  res.json({ message: 'USA Nums by Moon API', version: '7.0.0' });
+  res.json({ message: 'USA Nums by Moon API', version: '7.0.1' });
 });
 
 // 404
