@@ -1,19 +1,14 @@
 // ============================================
-// USA Nums by Moon — Backend API v7.0.1
+// USA Nums by Moon — Backend API v7.1.0
 // ============================================
-// Updates in this build (v7.0.1):
-// - FIXED: totalUsers counter stuck
-//     * increment on signup (new account)
-//     * increment on login when user doc is created for the first time
-//     * incrementCounters now bumps `updatedAt` so freshness check works
-//     * getCachedAdminCounters auto-recomputes from live data if meta doc is
-//       stale (>10 min) or missing required fields (fixes historical drift)
-// - FIXED: manage-gmails / manage-fb-ids / manage-tiktok / list-coupons 500
-//     * Root cause: Firestore composite indexes missing for
-//       where(...)+orderBy(createdAt) combos
-//     * Solution: switched to in-memory filter + sort + paginate
-//       (no composite index required, works on any project out-of-the-box)
-// - Preserved: all other endpoints, rate limiters, auth, caches, proxy
+// Updates in this build (v7.1.0):
+// - Added: 3 FB ID types under "Simple": simple, simple_2fa, simple_page
+//          (marketplace stays separate as before)
+// - Added: Outlook accounts — buy / admin add / manage / delete + counters
+// - Added: /api/auth/verify helper (frontend can pre-check token validity)
+// - Improved: signup auto-login retries once (helps redirect-loop edge case)
+// - Preserved: v7.0.1 fixes (totalUsers tracking, in-memory admin filters)
+// - Preserved: all other endpoints, rate limiters, caches, proxy, buy flows
 // ============================================
 
 const express = require('express');
@@ -174,23 +169,59 @@ function checkUserTransferLimit(uid) {
 }
 
 // ============================================
+// FB ID type registry (v7.1.0)
+// ============================================
+const FB_ID_TYPES = ['simple', 'simple_2fa', 'simple_page', 'marketplace'];
+
+function getFbPurchasedType(type) {
+  switch (type) {
+    case 'simple': return 'fb_simple';
+    case 'simple_2fa': return 'fb_simple_2fa';
+    case 'simple_page': return 'fb_simple_page';
+    case 'marketplace': return 'fb_marketplace';
+    default: return 'fb_simple';
+  }
+}
+
+function getFbServiceName(type) {
+  switch (type) {
+    case 'simple': return 'fbid_simple';
+    case 'simple_2fa': return 'fbid_simple_2fa';
+    case 'simple_page': return 'fbid_simple_page';
+    case 'marketplace': return 'fbid_marketplace';
+    default: return 'fbid_simple';
+  }
+}
+
+function getFbTypeLabel(type) {
+  switch (type) {
+    case 'simple': return 'Simple';
+    case 'simple_2fa': return '2FA Enabled';
+    case 'simple_page': return 'Page Created (2FA)';
+    case 'marketplace': return 'Marketplace Verified';
+    default: return 'Simple';
+  }
+}
+
+// ============================================
 // Cache system
 // ============================================
 let cache = {
   priceCounts: null,
   idPriceCounts: null,
   gmailPriceCounts: null,
+  outlookPriceCounts: null,
   fbIdPriceCounts: null,
   tiktokPriceCounts: null,
   adminCounters: null,
   timestamp: 0
 };
 const CACHE_TTL = 60000;
-const COUNTERS_FRESHNESS_MS = 10 * 60 * 1000; // 10 minutes
+const COUNTERS_FRESHNESS_MS = 10 * 60 * 1000;
 
 function cacheValid() {
   return cache.priceCounts && cache.idPriceCounts && cache.gmailPriceCounts &&
-    cache.fbIdPriceCounts && cache.tiktokPriceCounts &&
+    cache.outlookPriceCounts && cache.fbIdPriceCounts && cache.tiktokPriceCounts &&
     (Date.now() - cache.timestamp) < CACHE_TTL;
 }
 
@@ -200,15 +231,20 @@ async function getCachedAllPrices() {
       normal: cache.priceCounts,
       id: cache.idPriceCounts,
       gmail: cache.gmailPriceCounts,
+      outlook: cache.outlookPriceCounts,
       fbId: cache.fbIdPriceCounts,
       tiktok: cache.tiktokPriceCounts
     };
   }
 
-  const [normalSnapshot, idSnapshot, gmailSnapshot, fbIdSnapshot, tiktokSnapshot] = await Promise.all([
+  const [
+    normalSnapshot, idSnapshot, gmailSnapshot, outlookSnapshot,
+    fbIdSnapshot, tiktokSnapshot
+  ] = await Promise.all([
     db.collection('priceCounts').get(),
     db.collection('idPriceCounts').get(),
     db.collection('gmailPriceCounts').get(),
+    db.collection('outlookPriceCounts').get(),
     db.collection('fbIdPriceCounts').get(),
     db.collection('tiktokPriceCounts').get()
   ]);
@@ -222,7 +258,10 @@ async function getCachedAllPrices() {
   const gmail = {};
   gmailSnapshot.forEach(doc => { gmail[doc.id] = doc.data().availableCount || 0; });
 
-  const fbId = { simple: {}, marketplace: {} };
+  const outlook = {};
+  outlookSnapshot.forEach(doc => { outlook[doc.id] = doc.data().availableCount || 0; });
+
+  const fbId = { simple: {}, simple_2fa: {}, simple_page: {}, marketplace: {} };
   fbIdSnapshot.forEach(doc => {
     const data = doc.data();
     const type = data.type;
@@ -238,14 +277,14 @@ async function getCachedAllPrices() {
   cache.priceCounts = normal;
   cache.idPriceCounts = id;
   cache.gmailPriceCounts = gmail;
+  cache.outlookPriceCounts = outlook;
   cache.fbIdPriceCounts = fbId;
   cache.tiktokPriceCounts = tiktok;
   cache.timestamp = Date.now();
 
-  return { normal, id, gmail, fbId, tiktok };
+  return { normal, id, gmail, outlook, fbId, tiktok };
 }
 
-// ✅ FIXED: freshness + schema check so totalUsers drift auto-heals
 async function getCachedAdminCounters() {
   const now = Date.now();
   if (cache.adminCounters && (now - cache.timestamp) < CACHE_TTL) {
@@ -259,6 +298,7 @@ async function getCachedAdminCounters() {
       'totalUsers', 'availableNumbers', 'soldNumbers',
       'idAvailableNumbers', 'idSoldNumbers',
       'gmailAvailable', 'gmailSold',
+      'outlookAvailable', 'outlookSold',
       'fbIdsAvailable', 'fbIdsSold',
       'tiktokAvailable', 'tiktokSold'
     ];
@@ -270,10 +310,8 @@ async function getCachedAdminCounters() {
       cache.timestamp = now;
       return data;
     }
-    // stale or partial → recompute
   }
 
-  // Rebuild from live counts
   return await updateAdminCounters();
 }
 
@@ -282,6 +320,7 @@ async function updateAdminCounters() {
     usersCount, availableCount, soldCount,
     idAvailableCount, idSoldCount,
     gmailAvailableCount, gmailSoldCount,
+    outlookAvailableCount, outlookSoldCount,
     fbIdsAvailableCount, fbIdsSoldCount,
     tiktokAvailableCount, tiktokSoldCount
   ] = await Promise.all([
@@ -292,6 +331,8 @@ async function updateAdminCounters() {
     db.collection('idNumbers').where('status', '==', 'sold').count().get(),
     db.collection('gmails').where('status', '==', 'available').count().get(),
     db.collection('gmails').where('status', '==', 'sold').count().get(),
+    db.collection('outlooks').where('status', '==', 'available').count().get(),
+    db.collection('outlooks').where('status', '==', 'sold').count().get(),
     db.collection('fbIds').where('status', '==', 'available').count().get(),
     db.collection('fbIds').where('status', '==', 'sold').count().get(),
     db.collection('tiktokAccounts').where('status', '==', 'available').count().get(),
@@ -306,6 +347,8 @@ async function updateAdminCounters() {
     idSoldNumbers: idSoldCount.data().count || 0,
     gmailAvailable: gmailAvailableCount.data().count || 0,
     gmailSold: gmailSoldCount.data().count || 0,
+    outlookAvailable: outlookAvailableCount.data().count || 0,
+    outlookSold: outlookSoldCount.data().count || 0,
     fbIdsAvailable: fbIdsAvailableCount.data().count || 0,
     fbIdsSold: fbIdsSoldCount.data().count || 0,
     tiktokAvailable: tiktokAvailableCount.data().count || 0,
@@ -318,7 +361,6 @@ async function updateAdminCounters() {
   return counters;
 }
 
-// ✅ FIXED: bump updatedAt so freshness check works after increments
 async function incrementCounters(deltas) {
   try {
     await db.collection('meta').doc('counters').set(
@@ -332,7 +374,7 @@ async function incrementCounters(deltas) {
 }
 
 // ============================================
-// ✅ NEW HELPER: in-memory filter + sort + paginate
+// ✅ In-memory filter + sort + paginate
 // (avoids missing Firestore composite indexes)
 // ============================================
 async function fetchAllAndPaginate(collectionName, filterFn, lastDocId, pageLimit) {
@@ -389,6 +431,9 @@ async function verifyToken(req, res, next) {
       return res.status(401).json({ error: 'Authentication required' });
     }
     const idToken = authHeader.split(' ')[1];
+    if (!idToken || idToken === 'null' || idToken === 'undefined') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
     const decoded = await auth.verifyIdToken(idToken);
     req.uid = decoded.uid;
     req.email = decoded.email;
@@ -462,21 +507,31 @@ app.post('/api/auth/signup', signupLimiter, async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // ✅ FIXED: increment totalUsers
     await incrementCounters({ totalUsers: admin.firestore.FieldValue.increment(1) });
 
-    // Auto-login
+    // Auto-login with retry (v7.1.0 — helps edge cases where the first attempt
+    // fails transiently, preventing the login redirect loop right after signup)
     let idToken = null, refreshToken = null;
-    try {
-      const apiKey = process.env.FIREBASE_API_KEY;
-      const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: normalizedEmail, password, returnSecureToken: true })
-      });
-      const d = await r.json();
-      if (r.ok) { idToken = d.idToken; refreshToken = d.refreshToken; }
-    } catch (e) { console.error('Auto-login after signup failed:', e.message); }
+    for (let attempt = 0; attempt < 2 && !idToken; attempt++) {
+      try {
+        const apiKey = process.env.FIREBASE_API_KEY;
+        const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: normalizedEmail, password, returnSecureToken: true })
+        });
+        const d = await r.json();
+        if (r.ok && d.idToken) {
+          idToken = d.idToken;
+          refreshToken = d.refreshToken;
+        } else if (attempt === 0) {
+          await new Promise(resolve => setTimeout(resolve, 400));
+        }
+      } catch (e) {
+        console.error('Auto-login attempt failed:', e.message);
+        if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 400));
+      }
+    }
 
     res.json({ success: true, userId, email: normalizedEmail, idToken, refreshToken });
 
@@ -516,8 +571,6 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         orderCount: 0,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
-
-      // ✅ FIXED: increment totalUsers when creating user doc for the first time
       await incrementCounters({ totalUsers: admin.firestore.FieldValue.increment(1) });
     }
 
@@ -532,6 +585,28 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// ✅ NEW: Verify token (frontend can pre-check before critical calls)
+app.post('/api/auth/verify', generalLimiter, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.json({ valid: false, reason: 'no_token' });
+    }
+    const idToken = authHeader.split(' ')[1];
+    if (!idToken || idToken === 'null' || idToken === 'undefined') {
+      return res.json({ valid: false, reason: 'invalid_token' });
+    }
+    try {
+      const decoded = await auth.verifyIdToken(idToken);
+      return res.json({ valid: true, uid: decoded.uid, email: decoded.email });
+    } catch (e) {
+      return res.json({ valid: false, reason: 'expired_or_invalid', error: e.code });
+    }
+  } catch (err) {
+    return res.json({ valid: false, reason: 'server_error' });
   }
 });
 
@@ -615,65 +690,43 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
 
     const prices = await getCachedAllPrices();
 
-    const normalPriceList = Object.entries(prices.normal)
+    const buildList = (map) => Object.entries(map || {})
       .filter(([_, c]) => c > 0)
       .map(([price, availableCount]) => ({ price, availableCount }))
       .sort((a, b) => parseInt(a.price) - parseInt(b.price));
 
-    const idPriceList = Object.entries(prices.id)
-      .filter(([_, c]) => c > 0)
-      .map(([price, availableCount]) => ({ price, availableCount }))
-      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
+    const normalPriceList = buildList(prices.normal);
+    const idPriceList = buildList(prices.id);
+    const gmailPriceList = buildList(prices.gmail);
+    const outlookPriceList = buildList(prices.outlook);
+    const fbIdSimple = buildList(prices.fbId.simple || {});
+    const fbIdSimple2FA = buildList(prices.fbId.simple_2fa || {});
+    const fbIdSimplePage = buildList(prices.fbId.simple_page || {});
+    const fbIdMarketplace = buildList(prices.fbId.marketplace || {});
+    const tiktokPriceList = buildList(prices.tiktok || {});
 
-    const gmailPriceList = Object.entries(prices.gmail)
-      .filter(([_, c]) => c > 0)
-      .map(([price, availableCount]) => ({ price, availableCount }))
-      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
+    // Single query for all purchased — grouped by type
+    const allPurchasedSnapshot = await db.collection('users').doc(userId).collection('purchased')
+      .where('status', '==', 'active')
+      .orderBy('purchasedAt', 'desc').get();
 
-    const fbIdSimple = Object.entries(prices.fbId.simple || {})
-      .filter(([_, c]) => c > 0)
-      .map(([price, availableCount]) => ({ price, availableCount }))
-      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
-
-    const fbIdMarketplace = Object.entries(prices.fbId.marketplace || {})
-      .filter(([_, c]) => c > 0)
-      .map(([price, availableCount]) => ({ price, availableCount }))
-      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
-
-    const tiktokPriceList = Object.entries(prices.tiktok || {})
-      .filter(([_, c]) => c > 0)
-      .map(([price, availableCount]) => ({ price, availableCount }))
-      .sort((a, b) => parseInt(a.price) - parseInt(b.price));
-
-    const normalPurchased = await db.collection('users').doc(userId).collection('purchased')
-      .where('status', '==', 'active').where('type', '==', 'normal').orderBy('purchasedAt', 'desc').get();
     const myNumbers = [];
-    normalPurchased.forEach(doc => myNumbers.push({ id: doc.id, ...doc.data() }));
-
-    const idPurchased = await db.collection('users').doc(userId).collection('purchased')
-      .where('status', '==', 'active').where('type', '==', 'id').orderBy('purchasedAt', 'desc').get();
     const myIdNumbers = [];
-    idPurchased.forEach(doc => myIdNumbers.push({ id: doc.id, ...doc.data() }));
-
-    const gmailsPurchased = await db.collection('users').doc(userId).collection('purchased')
-      .where('status', '==', 'active').where('type', '==', 'gmail').orderBy('purchasedAt', 'desc').get();
     const myGmails = [];
-    gmailsPurchased.forEach(doc => myGmails.push({ id: doc.id, ...doc.data() }));
-
-    const [fbSimplePurchased, fbMarketPurchased] = await Promise.all([
-      db.collection('users').doc(userId).collection('purchased')
-        .where('status', '==', 'active').where('type', '==', 'fb_simple').orderBy('purchasedAt', 'desc').get(),
-      db.collection('users').doc(userId).collection('purchased')
-        .where('status', '==', 'active').where('type', '==', 'fb_marketplace').orderBy('purchasedAt', 'desc').get()
-    ]);
+    const myOutlooks = [];
     const myFbIds = [];
-    fbSimplePurchased.forEach(doc => myFbIds.push({ id: doc.id, ...doc.data() }));
-    fbMarketPurchased.forEach(doc => myFbIds.push({ id: doc.id, ...doc.data() }));
-
-    const tiktokPurchased = await db.collection('users').doc(userId).collection('purchased')
-      .where('status', '==', 'active').where('type', '==', 'tiktok').orderBy('purchasedAt', 'desc').get();
     const myTiktokAccounts = [];
-    tiktokPurchased.forEach(doc => myTiktokAccounts.push({ id: doc.id, ...doc.data() }));
+
+    allPurchasedSnapshot.forEach(doc => {
+      const item = { id: doc.id, ...doc.data() };
+      const t = item.type;
+      if (t === 'normal') myNumbers.push(item);
+      else if (t === 'id') myIdNumbers.push(item);
+      else if (t === 'gmail') myGmails.push(item);
+      else if (t === 'outlook') myOutlooks.push(item);
+      else if (t === 'tiktok') myTiktokAccounts.push(item);
+      else if (t && typeof t === 'string' && t.startsWith('fb_')) myFbIds.push(item);
+    });
 
     const transfersSnapshot = await db.collection('users').doc(userId).collection('transfers')
       .orderBy('timestamp', 'desc').limit(20).get();
@@ -698,11 +751,18 @@ app.post('/api/user/combined-dashboard', generalLimiter, verifyToken, async (req
       normalPriceList,
       idPriceList,
       gmailPriceList,
-      fbIdPriceList: { simple: fbIdSimple, marketplace: fbIdMarketplace },
+      outlookPriceList,
+      fbIdPriceList: {
+        simple: fbIdSimple,
+        simple_2fa: fbIdSimple2FA,
+        simple_page: fbIdSimplePage,
+        marketplace: fbIdMarketplace
+      },
       tiktokPriceList,
       myNumbers,
       myIdNumbers,
       myGmails,
+      myOutlooks,
       myFbIds,
       myTiktokAccounts,
       transfers
@@ -1012,14 +1072,144 @@ app.post('/api/user/buy-gmail', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// Buy FB IDs
+// ✅ NEW: Buy Outlook accounts
+app.post('/api/user/buy-outlook', buyLimiter, verifyToken, async (req, res) => {
+  try {
+    const userId = req.uid;
+    const { price, quantity } = req.body;
+
+    if (!price) return res.status(400).json({ error: 'Price required' });
+    if (!quantity || !Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
+      return res.status(400).json({ error: 'Quantity must be between 1 and 500' });
+    }
+
+    const priceStr = price.toString();
+
+    const result = await db.runTransaction(async (transaction) => {
+      const userRef = db.collection('users').doc(userId);
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) throw new Error('User not found');
+      const userData = userDoc.data();
+
+      const unitPrice = parseInt(priceStr);
+      const totalPrice = unitPrice * quantity;
+
+      if ((userData.balance || 0) < totalPrice) {
+        throw new Error(`Insufficient balance. Need ${totalPrice} PKR`);
+      }
+
+      const outlookQuery = await transaction.get(
+        db.collection('outlooks')
+          .where('price', '==', priceStr)
+          .where('status', '==', 'available')
+          .limit(quantity)
+      );
+
+      if (outlookQuery.size < quantity) {
+        throw new Error(`Only ${outlookQuery.size} available at this price. Please reduce quantity.`);
+      }
+
+      const purchasedItems = [];
+
+      for (const doc of outlookQuery.docs) {
+        const outlookData = doc.data();
+
+        transaction.update(doc.ref, {
+          status: 'sold',
+          soldTo: userId,
+          soldAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        const purchasedRef = db.collection('users').doc(userId).collection('purchased').doc(doc.id);
+        transaction.set(purchasedRef, {
+          email: outlookData.email,
+          password: outlookData.password,
+          price: priceStr,
+          type: 'outlook',
+          status: 'active',
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        purchasedItems.push({
+          id: doc.id,
+          email: outlookData.email,
+          password: outlookData.password,
+          price: priceStr
+        });
+      }
+
+      const priceCountRef = db.collection('outlookPriceCounts').doc(priceStr);
+      transaction.set(priceCountRef, {
+        availableCount: admin.firestore.FieldValue.increment(-quantity),
+        soldCount: admin.firestore.FieldValue.increment(quantity)
+      }, { merge: true });
+
+      const currentOrderCount = userData.orderCount || 0;
+      const newOrderNumber = currentOrderCount + 1;
+
+      transaction.update(userRef, {
+        balance: admin.firestore.FieldValue.increment(-totalPrice),
+        orderCount: newOrderNumber
+      });
+
+      const orderRef = db.collection('users').doc(userId).collection('orders').doc();
+      transaction.set(orderRef, {
+        orderNumber: newOrderNumber,
+        service: 'outlook',
+        quantity,
+        perUnitPrice: unitPrice,
+        originalTotal: totalPrice,
+        discount: 0,
+        total: totalPrice,
+        couponCode: null,
+        items: purchasedItems,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      const historyRef = db.collection('users').doc(userId).collection('history').doc();
+      transaction.set(historyRef, {
+        type: 'purchase',
+        details: `Bought ${quantity} Outlook account(s) at ${unitPrice} PKR each`,
+        amount: -totalPrice,
+        balanceAfter: (userData.balance || 0) - totalPrice,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return {
+        quantity,
+        totalPrice,
+        newBalance: (userData.balance || 0) - totalPrice,
+        orderNumber: newOrderNumber,
+        outlooks: purchasedItems
+      };
+    });
+
+    await incrementCounters({
+      outlookAvailable: admin.firestore.FieldValue.increment(-quantity),
+      outlookSold: admin.firestore.FieldValue.increment(quantity)
+    });
+
+    cache.timestamp = 0;
+    res.json({ success: true, ...result });
+
+  } catch (error) {
+    console.error('Buy outlook error:', error);
+    const msg = error?.message || '';
+    if (msg.includes('Insufficient balance')) return res.status(400).json({ error: msg });
+    if (msg.includes('available at this price')) return res.status(400).json({ error: msg });
+    if (msg.includes('User not found')) return res.status(404).json({ error: 'User not found' });
+    res.status(400).json({ error: 'Purchase failed' });
+  }
+});
+
+// ✅ UPDATED: Buy FB IDs — supports 4 types
 app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
     const { type, price, quantity } = req.body;
 
-    if (!type || !['simple', 'marketplace'].includes(type)) {
-      return res.status(400).json({ error: 'Invalid type. Must be simple or marketplace' });
+    if (!type || !FB_ID_TYPES.includes(type)) {
+      return res.status(400).json({ error: 'Invalid type. Must be simple, simple_2fa, simple_page, or marketplace' });
     }
     if (!price) return res.status(400).json({ error: 'Price required' });
     if (!quantity || !Number.isInteger(quantity) || quantity < 1 || quantity > 500) {
@@ -1027,8 +1217,8 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
     }
 
     const priceStr = price.toString();
-    const purchasedType = type === 'marketplace' ? 'fb_marketplace' : 'fb_simple';
-    const serviceName = type === 'marketplace' ? 'fbid_marketplace' : 'fbid_simple';
+    const purchasedType = getFbPurchasedType(type);
+    const serviceName = getFbServiceName(type);
 
     const result = await db.runTransaction(async (transaction) => {
       const userRef = db.collection('users').doc(userId);
@@ -1073,6 +1263,7 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
           twoFA: fbData.twoFA || null,
           price: priceStr,
           type: purchasedType,
+          fbIdType: type,
           status: 'active',
           purchasedAt: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -1119,7 +1310,7 @@ app.post('/api/user/buy-fb-id', buyLimiter, verifyToken, async (req, res) => {
       const historyRef = db.collection('users').doc(userId).collection('history').doc();
       transaction.set(historyRef, {
         type: 'purchase',
-        details: `Bought ${quantity} ${type === 'marketplace' ? 'Marketplace Verified' : 'Simple'} FB ID(s) at ${unitPrice} PKR each`,
+        details: `Bought ${quantity} ${getFbTypeLabel(type)} FB ID(s) at ${unitPrice} PKR each`,
         amount: -totalPrice,
         balanceAfter: (userData.balance || 0) - totalPrice,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
@@ -1286,7 +1477,7 @@ app.post('/api/user/buy-tiktok', buyLimiter, verifyToken, async (req, res) => {
   }
 });
 
-// Delete purchased items (gmail/fbid/tiktok)
+// Delete purchased items (gmail/outlook/fbid/tiktok)
 app.post('/api/user/delete-purchased', generalLimiter, verifyToken, async (req, res) => {
   try {
     const userId = req.uid;
@@ -1814,6 +2005,8 @@ app.post('/api/admin/combined-dashboard', generalLimiter, requireAdminToken, asy
       idSoldNumbers: counters.idSoldNumbers || 0,
       gmailAvailable: counters.gmailAvailable || 0,
       gmailSold: counters.gmailSold || 0,
+      outlookAvailable: counters.outlookAvailable || 0,
+      outlookSold: counters.outlookSold || 0,
       fbIdsAvailable: counters.fbIdsAvailable || 0,
       fbIdsSold: counters.fbIdsSold || 0,
       tiktokAvailable: counters.tiktokAvailable || 0,
@@ -1838,6 +2031,8 @@ app.post('/api/admin/dashboard', generalLimiter, requireAdminToken, async (req, 
       idSoldNumbers: counters.idSoldNumbers || 0,
       gmailAvailable: counters.gmailAvailable || 0,
       gmailSold: counters.gmailSold || 0,
+      outlookAvailable: counters.outlookAvailable || 0,
+      outlookSold: counters.outlookSold || 0,
       fbIdsAvailable: counters.fbIdsAvailable || 0,
       fbIdsSold: counters.fbIdsSold || 0,
       tiktokAvailable: counters.tiktokAvailable || 0,
@@ -2163,7 +2358,7 @@ app.post('/api/admin/add-gmails', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// ✅ FIXED: Manage Gmails — in-memory filter + sort + paginate
+// Manage Gmails — in-memory filter + sort + paginate
 app.post('/api/admin/manage-gmails', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId, limit } = req.body;
@@ -2252,13 +2447,146 @@ app.post('/api/admin/delete-gmails', generalLimiter, requireAdminToken, async (r
   }
 });
 
-// Admin: Add FB IDs
+// ✅ NEW: Admin Add Outlooks
+app.post('/api/admin/add-outlooks', generalLimiter, requireAdminToken, async (req, res) => {
+  try {
+    const { outlooksText, price } = req.body;
+    if (!outlooksText || !price) return res.status(400).json({ error: 'Outlooks text and price required' });
+
+    const lines = outlooksText.trim().split('\n');
+    const batch = db.batch();
+    let addedCount = 0;
+    const priceStr = price.toString();
+    const priceCountRef = db.collection('outlookPriceCounts').doc(priceStr);
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine || !trimmedLine.includes('|')) continue;
+      const parts = trimmedLine.split('|');
+      const email = parts[0]?.trim();
+      const password = parts[1]?.trim();
+      if (!email || !password) continue;
+      batch.set(db.collection('outlooks').doc(), {
+        email, password, price: priceStr, status: 'available',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      addedCount++;
+    }
+    if (addedCount === 0) return res.status(400).json({ error: 'No valid outlooks found. Use format: email|password' });
+
+    batch.set(priceCountRef, {
+      availableCount: admin.firestore.FieldValue.increment(addedCount),
+      soldCount: admin.firestore.FieldValue.increment(0)
+    }, { merge: true });
+
+    await batch.commit();
+    await incrementCounters({
+      outlookAvailable: admin.firestore.FieldValue.increment(addedCount)
+    });
+    cache.timestamp = 0;
+    res.json({ success: true, addedCount, message: `${addedCount} outlooks added successfully at PKR ${price}` });
+  } catch (error) {
+    console.error('Add outlooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ✅ NEW: Manage Outlooks
+app.post('/api/admin/manage-outlooks', generalLimiter, requireAdminToken, async (req, res) => {
+  try {
+    const { status, lastDocId, limit } = req.body;
+    const pageLimit = limit || 50;
+
+    const filterFn = (d) => {
+      if (status && status !== 'all' && d.status !== status) return false;
+      return true;
+    };
+
+    const result = await fetchAllAndPaginate('outlooks', filterFn, lastDocId, pageLimit);
+
+    const outlooks = result.docs.map(d => ({
+      id: d.id,
+      email: d.email,
+      password: d.status === 'sold' ? '••••••••' : d.password,
+      price: d.price,
+      status: d.status,
+      soldTo: d.soldTo || null,
+      createdAt: d.createdAt
+    }));
+
+    res.json({ outlooks, lastDocId: result.lastDocId, hasMore: result.hasMore });
+  } catch (error) {
+    console.error('Manage outlooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ✅ NEW: Delete Outlooks
+app.post('/api/admin/delete-outlooks', generalLimiter, requireAdminToken, async (req, res) => {
+  try {
+    const { outlookIds, deleteAllSold } = req.body;
+
+    if (deleteAllSold) {
+      const soldSnapshot = await db.collection('outlooks').where('status', '==', 'sold').get();
+      const batch = db.batch();
+      let deletedCount = 0;
+      soldSnapshot.forEach(doc => { batch.delete(doc.ref); deletedCount++; });
+      if (deletedCount > 0) await batch.commit();
+      await incrementCounters({ outlookSold: admin.firestore.FieldValue.increment(-deletedCount) });
+      cache.timestamp = 0;
+      return res.json({ success: true, message: `${deletedCount} sold outlooks deleted` });
+    }
+
+    if (!outlookIds || !Array.isArray(outlookIds) || outlookIds.length === 0) {
+      return res.status(400).json({ error: 'No outlooks specified' });
+    }
+
+    const BATCH_SIZE = 10;
+    let totalDeleted = 0;
+    const priceUpdates = {};
+
+    for (let i = 0; i < outlookIds.length; i += BATCH_SIZE) {
+      const batch = db.batch();
+      const chunk = outlookIds.slice(i, i + BATCH_SIZE);
+      const priceUpdatesInChunk = {};
+
+      for (const id of chunk) {
+        const outlookDoc = await db.collection('outlooks').doc(id).get();
+        if (outlookDoc.exists) {
+          const d = outlookDoc.data();
+          if (d.status === 'available') {
+            const price = d.price.toString();
+            priceUpdatesInChunk[price] = (priceUpdatesInChunk[price] || 0) + 1;
+          }
+          batch.delete(outlookDoc.ref);
+          totalDeleted++;
+        }
+      }
+
+      for (const [price, count] of Object.entries(priceUpdatesInChunk)) {
+        const priceCountRef = db.collection('outlookPriceCounts').doc(price);
+        batch.set(priceCountRef, { availableCount: admin.firestore.FieldValue.increment(-count) }, { merge: true });
+        priceUpdates[price] = (priceUpdates[price] || 0) + count;
+      }
+
+      await batch.commit();
+    }
+
+    cache.timestamp = 0;
+    res.json({ success: true, message: `${totalDeleted} outlooks deleted successfully`, priceUpdates });
+  } catch (error) {
+    console.error('Delete outlooks error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ✅ UPDATED: Admin Add FB IDs — supports 4 types
 app.post('/api/admin/add-fb-ids', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { fbIdsText, price, type } = req.body;
     if (!fbIdsText || !price || !type) return res.status(400).json({ error: 'FB IDs text, price, and type required' });
-    if (!['simple', 'marketplace'].includes(type)) {
-      return res.status(400).json({ error: 'Type must be simple or marketplace' });
+    if (!FB_ID_TYPES.includes(type)) {
+      return res.status(400).json({ error: 'Type must be simple, simple_2fa, simple_page, or marketplace' });
     }
 
     const lines = fbIdsText.trim().split('\n');
@@ -2296,14 +2624,14 @@ app.post('/api/admin/add-fb-ids', generalLimiter, requireAdminToken, async (req,
       fbIdsAvailable: admin.firestore.FieldValue.increment(addedCount)
     });
     cache.timestamp = 0;
-    res.json({ success: true, addedCount, message: `${addedCount} ${type} FB IDs added successfully at PKR ${price}` });
+    res.json({ success: true, addedCount, message: `${addedCount} ${getFbTypeLabel(type)} FB IDs added successfully at PKR ${price}` });
   } catch (error) {
     console.error('Add fb ids error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ✅ FIXED: Manage FB IDs — in-memory filter + sort + paginate
+// Manage FB IDs — in-memory filter + sort + paginate (supports all 4 types)
 app.post('/api/admin/manage-fb-ids', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, type, lastDocId, limit } = req.body;
@@ -2443,7 +2771,7 @@ app.post('/api/admin/add-tiktok', generalLimiter, requireAdminToken, async (req,
   }
 });
 
-// ✅ FIXED: Manage TikTok — in-memory filter + sort + paginate
+// Manage TikTok — in-memory filter + sort + paginate
 app.post('/api/admin/manage-tiktok', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, lastDocId, limit } = req.body;
@@ -2602,7 +2930,7 @@ app.post('/api/admin/generate-coupons', generalLimiter, requireAdminToken, async
   }
 });
 
-// ✅ FIXED: List Coupons — in-memory filter + sort + paginate
+// List Coupons — in-memory filter + sort + paginate
 app.post('/api/admin/list-coupons', generalLimiter, requireAdminToken, async (req, res) => {
   try {
     const { status, type, lastDocId, limit } = req.body;
@@ -2791,7 +3119,6 @@ app.post('/api/admin/delete-user', generalLimiter, requireAdminToken, async (req
 
     try { await auth.deleteUser(userId); } catch (authError) { console.error('Auth deletion error:', authError); }
 
-    // ✅ Recompute all counters (includes totalUsers correctly)
     await updateAdminCounters();
     cache.timestamp = 0;
     res.json({ success: true });
@@ -2809,16 +3136,16 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     firebase: admin.apps.length > 0 ? 'connected' : 'disconnected',
-    version: '7.0.1'
+    version: '7.1.0'
   });
 });
 
 app.get('/api/version', (req, res) => {
-  res.json({ version: '7.0.1', timestamp: Date.now() });
+  res.json({ version: '7.1.0', timestamp: Date.now() });
 });
 
 app.get('/', (req, res) => {
-  res.json({ message: 'USA Nums by Moon API', version: '7.0.1' });
+  res.json({ message: 'USA Nums by Moon API', version: '7.1.0' });
 });
 
 // 404
